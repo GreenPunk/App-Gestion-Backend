@@ -31,6 +31,8 @@ const PORT = process.env.PORT || 4000;
 app.use(cors({
   origin: [
   "https://tasaciones-inmobiliarias.vercel.app",
+  "https://app-saa-s-gestion-inmobiliaria.vercel.app",
+  "https://app-saa-s-gestion-inmobiliaria-nwtyoqz8u.vercel.app",
   "http://localhost:5173",
   "http://localhost:3000",
 ],
