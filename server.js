@@ -33,6 +33,7 @@ app.use(cors({
   "https://tasaciones-inmobiliarias.vercel.app",
   "https://app-saa-s-gestion-inmobiliaria.vercel.app",
   "https://app-saa-s-gestion-inmobiliaria-nwtyoqz8u.vercel.app",
+  "https://app-saa-s-gestion-inmobiliaria-9j8k2kmvb.vercel.app",
   "http://localhost:5173",
   "http://localhost:3000",
 ],
@@ -158,6 +159,10 @@ app.post("/api/generar-docx", upload.single("plantilla"), (req, res) => {
     res.status(500).json({ error: "Error interno al procesar el documento", detalle: err.message });
   }
 });
+
+// ── RUTAS RAÍZ Y ALIAS ───────────────────────────────────────
+app.get("/",       (req, res) => res.json({ status: "ok", version: "1.0.0", ts: new Date().toISOString() }));
+app.get("/health", (req, res) => res.json({ status: "ok", version: "1.0.0", ts: new Date().toISOString() }));
 
 // ── ENDPOINT HEALTH ───────────────────────────────────────────
 app.get("/api/health", (req, res) => {
