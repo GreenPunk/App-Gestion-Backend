@@ -333,6 +333,15 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "Falta el campo 'mensaje'" });
     }
 
+    // Verificar que el módulo agenteIA esté habilitado para este tenant
+    if (tenantId) {
+      const tenantRows = await sbQuery("tenants", `id=eq.${tenantId}&select=modulos`);
+      const modulos = tenantRows[0]?.modulos;
+      if (Array.isArray(modulos) && !modulos.includes("agenteIA")) {
+        return res.status(403).json({ error: "El módulo Agente IA no está habilitado para esta cuenta." });
+      }
+    }
+
     // Construir contexto solo si no viene cacheado del cliente
     const ctx = contexto || await buildTenantContext(tenantId);
 
@@ -456,14 +465,14 @@ app.post("/api/generar-docx", upload.single("plantilla"), (req, res) => {
 });
 
 // ── Health ────────────────────────────────────────────────────
-const healthRes = () => ({ status: "ok", version: "2.3.0", ts: new Date().toISOString() });
+const healthRes = () => ({ status: "ok", version: "2.4.0", ts: new Date().toISOString() });
 app.get("/",           (req, res) => res.json(healthRes()));
 app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.3.0 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.4.0 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
   console.log(`   GET  http://localhost:${PORT}/api/health\n`);
