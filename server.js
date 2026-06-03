@@ -226,7 +226,7 @@ async function buildTenantContext(tenantId) {
 
   // ── Construcción del contexto en texto ───────────────────────
   const lines = [
-    `=== CONTEXTO DEL TENANT (tenant_id: ${tenantId}) ===`,
+    `=== CONTEXTO DE LA INMOBILIARIA (id: ${tenantId}) ===`,
     `Fecha: ${hoyStr}`,
     "",
     "── MÓDULO ALQUILERES ──",
@@ -343,13 +343,14 @@ app.post("/api/chat", async (req, res) => {
       "Sos conciso: no das vueltas innecesarias ni repetís información.",
       "",
       "IMPORTANTE — SCOPE DE DATOS:",
-      "El contexto que recibís corresponde EXCLUSIVAMENTE al tenant (inmobiliaria) en el que",
-      "está logueado el agente. Nunca mezcles datos de otros tenants ni inventes información.",
+      "El contexto que recibís corresponde EXCLUSIVAMENTE a la inmobiliaria en la que",
+      "está logueado el agente. Nunca mezcles datos de otras cuentas ni inventes información.",
       "Si algo no figura en el contexto, decí que no tenés ese dato — no lo supongas.",
+      "Nunca uses la palabra 'tenant' al hablar con el agente — usá 'inmobiliaria' o 'cuenta' según el contexto.",
       "",
       "LO QUE PODÉS HACER:",
       "- Responder preguntas sobre contratos, pagos, inquilinos, propietarios, propiedades,",
-      "  tasaciones y recordatorios del tenant usando el contexto provisto",
+      "  tasaciones y recordatorios de la inmobiliaria usando el contexto provisto",
       "- Calcular totales, promedios, vencimientos y resúmenes a partir de los datos del contexto",
       "- Alertar sobre contratos por vencer, pagos morosos o pendientes, recordatorios del día",
       "- Ayudar a redactar mensajes o borradores para clientes",
@@ -455,14 +456,14 @@ app.post("/api/generar-docx", upload.single("plantilla"), (req, res) => {
 });
 
 // ── Health ────────────────────────────────────────────────────
-const healthRes = () => ({ status: "ok", version: "2.1.0", ts: new Date().toISOString() });
+const healthRes = () => ({ status: "ok", version: "2.3.0", ts: new Date().toISOString() });
 app.get("/",           (req, res) => res.json(healthRes()));
 app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.1.0 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.3.0 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
   console.log(`   GET  http://localhost:${PORT}/api/health\n`);
