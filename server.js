@@ -36,7 +36,7 @@ app.use(cors({
     "http://localhost:5173",
     "http://localhost:3000",
   ],
-  methods: ["GET", "POST", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "PATCH", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
 
@@ -364,11 +364,40 @@ app.post("/api/chat", async (req, res) => {
       "- Alertar sobre contratos por vencer, pagos morosos o pendientes, recordatorios del día",
       "- Ayudar a redactar mensajes o borradores para clientes",
       "- Responder preguntas generales sobre el mercado inmobiliario argentino",
+      "- CREAR RECORDATORIOS en nombre del agente (ver instrucciones abajo)",
       "",
       "LO QUE NO PODÉS HACER:",
-      "- Modificar datos — eso se hace desde los módulos de la app",
+      "- Modificar contratos, pagos u otros datos — eso se hace desde los módulos de la app",
       "- Inventar datos que no estén en el contexto",
       "- Acceder a información de otros tenants",
+      "",
+      "── CREAR RECORDATORIOS ──",
+      "Cuando el agente pide agendar algo (ej: 'agendame llamar a Juan mañana a las 15h',",
+      "'recordame contactar a García el viernes', 'poneme un recordatorio para el lunes 9am'),",
+      "DEBES responder ÚNICAMENTE con un bloque JSON con este formato exacto, sin texto adicional antes ni después:",
+      "",
+      "```json",
+      "{",
+      '  "accion": "crear_recordatorio",',
+      '  "asunto": "Llamar a Juan",',
+      '  "destino_nombre": "Juan",',
+      '  "fecha_envio": "2026-06-12T15:00:00",',
+      '  "mensaje": "Recordatorio para llamar a Juan"',
+      "}",
+      "```",
+      "",
+      "Reglas para el JSON:",
+      "- 'accion' siempre es 'crear_recordatorio'",
+      "- 'asunto': frase corta descriptiva (máx 60 caracteres)",
+      "- 'destino_nombre': nombre de la persona a contactar (extraído del mensaje del agente)",
+      "- 'fecha_envio': fecha y hora en formato ISO 'YYYY-MM-DDTHH:MM:00' en zona local Argentina (UTC-3).",
+      `  La fecha de hoy es ${new Date().toISOString().split("T")[0]}.`,
+      "  'mañana' = hoy + 1 día. 'el lunes' = próximo lunes. Si no especifica hora, usar 08:00.",
+      "- 'mensaje': mensaje opcional para recordar el contexto (puede ser null)",
+      "",
+      "Si falta información crítica (como la fecha), preguntá antes de generar el JSON.",
+      "Si el agente menciona una persona que aparece en el contexto (propietario, inquilino),",
+      "intentá completar 'destino_nombre' con el nombre completo que figura en los datos.",
       "",
       `Agente logueado: ${agentEmail || "desconocido"}`,
       "",
@@ -464,18 +493,209 @@ app.post("/api/generar-docx", upload.single("plantilla"), (req, res) => {
   }
 });
 
+// ── ENDPOINT /api/recordatorios ───────────────────────────────
+/**
+ * POST /api/recordatorios
+ *
+ * Crea un recordatorio en tas_recordatorios desde el AgentePanel.
+ * Body JSON:
+ *   {
+ *     tenantId:       string,
+ *     agentEmail:     string,
+ *     agentNombre:    string,
+ *     agentTgId:      string | null,
+ *     asunto:         string,
+ *     mensaje:        string | null,
+ *     fecha_envio:    string (ISO),
+ *     destino_nombre: string,
+ *     destino_email:  string | null,
+ *     destino_tel:    string | null,
+ *     modulo:         string,
+ *   }
+ */
+app.post("/api/recordatorios", async (req, res) => {
+  try {
+    const {
+      tenantId, agentEmail, agentNombre, agentTgId,
+      asunto, mensaje, fecha_envio,
+      destino_nombre, destino_email, destino_tel,
+      modulo = "agenteIA",
+    } = req.body;
+
+    if (!tenantId)      return res.status(400).json({ error: "Falta tenantId" });
+    if (!asunto)        return res.status(400).json({ error: "Falta asunto" });
+    if (!fecha_envio)   return res.status(400).json({ error: "Falta fecha_envio" });
+    if (!destino_nombre) return res.status(400).json({ error: "Falta destino_nombre" });
+
+    // ── Validar que el agentEmail pertenece al tenantId declarado ─
+    // Evita que un agente de otro tenant inserte recordatorios en este tenant.
+    if (agentEmail) {
+      const agentRows = await sbQuery(
+        "agents",
+        `data->>email=eq.${encodeURIComponent(agentEmail)}&tenant_id=eq.${tenantId}&select=id&limit=1`
+      );
+      if (agentRows.length === 0) {
+        console.warn(`[recordatorios] Agente ${agentEmail} no pertenece al tenant ${tenantId} — rechazado`);
+        return res.status(403).json({ error: "El agente no pertenece a esta cuenta." });
+      }
+    }
+
+    const payload = {
+      tenant_id:             tenantId,
+      agente_id:             agentEmail || null,
+      agente_nombre:         agentNombre || agentEmail || null,
+      propietario_nombre:    destino_nombre,
+      propietario_email:     destino_email || null,
+      propietario_telefono:  destino_tel   || null,
+      asunto:                asunto,
+      mensaje_personalizado: mensaje       || null,
+      fecha_envio:           fecha_envio,
+      estado:                "pendiente",
+      canal:                 "email",
+      modulo:                modulo,
+    };
+
+    const sbRes = await fetch(`${SB_URL}/rest/v1/tas_recordatorios`, {
+      method:  "POST",
+      headers: {
+        "apikey":        SB_KEY,
+        "Authorization": `Bearer ${SB_KEY}`,
+        "Content-Type":  "application/json",
+        "Prefer":        "return=representation",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!sbRes.ok) {
+      const e = await sbRes.text();
+      return res.status(500).json({ error: "Error al guardar en Supabase", detalle: e });
+    }
+
+    const rows = await sbRes.json();
+    const creado = Array.isArray(rows) ? rows[0] : rows;
+    console.log(`[recordatorios] Creado id=${creado?.id} tenant=${tenantId} asunto="${asunto}"`);
+    res.json({ ok: true, id: creado?.id });
+
+  } catch (err) {
+    console.error("[recordatorios] Error:", err.message);
+    res.status(500).json({ error: "Error interno", detalle: err.message });
+  }
+});
+
+// ── CRON: disparar recordatorios pendientes ───────────────────
+// Cada 5 minutos busca recordatorios con fecha_envio <= ahora y estado=pendiente
+// y envía notificación por email al agente (si RESEND_API_KEY está configurada).
+// Marca el recordatorio como "enviado" al completarse.
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const FROM_EMAIL     = process.env.FROM_EMAIL     || "recordatorios@alvarez-inmobiliaria.com";
+
+async function enviarEmailResend(to, subject, html) {
+  if (!RESEND_API_KEY) {
+    console.warn("[cron] RESEND_API_KEY no configurada — email no enviado a:", to);
+    return false;
+  }
+  try {
+    const r = await fetch("https://api.resend.com/emails", {
+      method:  "POST",
+      headers: {
+        "Authorization": `Bearer ${RESEND_API_KEY}`,
+        "Content-Type":  "application/json",
+      },
+      body: JSON.stringify({ from: FROM_EMAIL, to: [to], subject, html }),
+    });
+    if (!r.ok) {
+      const e = await r.text();
+      console.error("[cron] Resend error:", e);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error("[cron] Resend exception:", e.message);
+    return false;
+  }
+}
+
+async function procesarRecordatoriosPendientes() {
+  if (!SB_URL || !SB_KEY) return;
+  try {
+    const ahora = new Date().toISOString();
+    // Buscar recordatorios pendientes cuya fecha_envio ya pasó
+    const pendientes = await sbQuery(
+      "tas_recordatorios",
+      `estado=eq.pendiente&fecha_envio=lte.${encodeURIComponent(ahora)}&select=*&limit=50`
+    );
+
+    if (pendientes.length === 0) return;
+    console.log(`[cron] ${pendientes.length} recordatorio(s) a disparar`);
+
+    for (const rec of pendientes) {
+      let enviado = false;
+
+      // Enviar email al agente si tiene email
+      const emailAgente = rec.agente_id || rec.agente_nombre;
+      if (emailAgente && emailAgente.includes("@")) {
+        const horaDisplay = rec.fecha_envio
+          ? new Date(rec.fecha_envio).toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" })
+          : "";
+        const htmlEmail = `
+          <div style="font-family:sans-serif;max-width:480px;margin:auto">
+            <h2 style="color:#790202">🔔 Recordatorio: ${rec.asunto}</h2>
+            <p><strong>Para:</strong> ${rec.propietario_nombre || "—"}</p>
+            ${rec.propietario_telefono ? `<p><strong>Tel:</strong> ${rec.propietario_telefono}</p>` : ""}
+            ${rec.propietario_email    ? `<p><strong>Email:</strong> ${rec.propietario_email}</p>` : ""}
+            ${rec.mensaje_personalizado ? `<p><strong>Mensaje:</strong> ${rec.mensaje_personalizado}</p>` : ""}
+            <p style="color:#888;font-size:12px">Programado para: ${horaDisplay}</p>
+            ${rec.propietario_telefono
+              ? `<a href="https://wa.me/54${rec.propietario_telefono.replace(/\D/g,"")}${rec.mensaje_personalizado ? "?text=" + encodeURIComponent(rec.mensaje_personalizado) : ""}"
+                   style="display:inline-block;margin-top:12px;background:#25d366;color:white;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:bold">
+                   💬 Enviar por WhatsApp
+                 </a>`
+              : ""}
+          </div>`;
+        enviado = await enviarEmailResend(emailAgente, `🔔 Recordatorio: ${rec.asunto}`, htmlEmail);
+      }
+
+      // Marcar como enviado en Supabase
+      try {
+        await fetch(`${SB_URL}/rest/v1/tas_recordatorios?id=eq.${rec.id}`, {
+          method:  "PATCH",
+          headers: {
+            "apikey":        SB_KEY,
+            "Authorization": `Bearer ${SB_KEY}`,
+            "Content-Type":  "application/json",
+            "Prefer":        "return=minimal",
+          },
+          body: JSON.stringify({ estado: "enviado" }),
+        });
+        console.log(`[cron] Recordatorio id=${rec.id} marcado como enviado (email=${enviado})`);
+      } catch (e) {
+        console.error(`[cron] Error al marcar id=${rec.id}:`, e.message);
+      }
+    }
+  } catch (e) {
+    console.error("[cron] Error general:", e.message);
+  }
+}
+
+// Arrancar cron cada 5 minutos
+setInterval(procesarRecordatoriosPendientes, 5 * 60 * 1000);
+// También correr 30 segundos después del arranque (para no esperar 5 min al primer deploy)
+setTimeout(procesarRecordatoriosPendientes, 30 * 1000);
+
 // ── Health ────────────────────────────────────────────────────
-const healthRes = () => ({ status: "ok", version: "2.4.0", ts: new Date().toISOString() });
+const healthRes = () => ({ status: "ok", version: "2.5.0", ts: new Date().toISOString() });
 app.get("/",           (req, res) => res.json(healthRes()));
 app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.4.0 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.0 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
+  console.log(`   POST http://localhost:${PORT}/api/recordatorios`);
   console.log(`   GET  http://localhost:${PORT}/api/health\n`);
   if (!process.env.ANTHROPIC_API_KEY) console.warn("⚠️  ANTHROPIC_API_KEY no configurada — /api/chat no va a funcionar");
   if (!process.env.SUPABASE_URL)      console.warn("⚠️  SUPABASE_URL no configurada — contexto del agente estará vacío");
+  if (!process.env.RESEND_API_KEY)    console.warn("⚠️  RESEND_API_KEY no configurada — cron enviará emails en modo silencioso");
 });
