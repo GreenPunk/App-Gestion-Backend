@@ -421,7 +421,7 @@ app.post("/api/chat", async (req, res) => {
 
     // Streaming con Anthropic SDK
     const stream = await anthropic.messages.stream({
-      model:      "claude-sonnet-4-20250514",
+      model:      "claude-sonnet-4-5",
       max_tokens: 1000,
       system:     systemPrompt,
       messages:   mensajesApi,
@@ -683,14 +683,14 @@ setInterval(procesarRecordatoriosPendientes, 5 * 60 * 1000);
 setTimeout(procesarRecordatoriosPendientes, 30 * 1000);
 
 // ── Health ────────────────────────────────────────────────────
-const healthRes = () => ({ status: "ok", version: "2.5.0", ts: new Date().toISOString() });
+const healthRes = () => ({ status: "ok", version: "2.5.1", ts: new Date().toISOString() });
 app.get("/",           (req, res) => res.json(healthRes()));
 app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.0 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.1 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
   console.log(`   POST http://localhost:${PORT}/api/recordatorios`);
