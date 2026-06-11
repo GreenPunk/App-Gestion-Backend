@@ -522,26 +522,31 @@ app.post("/api/recordatorios", async (req, res) => {
       modulo = "agenteIA",
     } = req.body;
 
-    if (!tenantId)      return res.status(400).json({ error: "Falta tenantId" });
-    if (!asunto)        return res.status(400).json({ error: "Falta asunto" });
-    if (!fecha_envio)   return res.status(400).json({ error: "Falta fecha_envio" });
+    console.log(`[recordatorios] POST recibido — tenant=${tenantId} agent=${agentEmail} asunto="${asunto}"`);
+
+    if (!tenantId)       return res.status(400).json({ error: "Falta tenantId" });
+    if (!asunto)         return res.status(400).json({ error: "Falta asunto" });
+    if (!fecha_envio)    return res.status(400).json({ error: "Falta fecha_envio" });
     if (!destino_nombre) return res.status(400).json({ error: "Falta destino_nombre" });
 
     // ── Validar que el agentEmail pertenece al tenantId declarado ─
-    // Evita que un agente de otro tenant inserte recordatorios en este tenant.
     if (agentEmail) {
       const agentRows = await sbQuery(
         "agents",
         `tenant_id=eq.${tenantId}&select=id,data&limit=50`
       );
+      console.log(`[recordatorios] agentRows encontrados: ${agentRows.length}`);
       const perteneceAlTenant = agentRows.some(r => {
-        const d = typeof r.data === "object" ? r.data : JSON.parse(r.data || "{}");
-        return d?.email === agentEmail;
+        try {
+          const d = typeof r.data === "object" ? r.data : JSON.parse(r.data || "{}");
+          return d?.email === agentEmail;
+        } catch { return false; }
       });
       if (!perteneceAlTenant) {
         console.warn(`[recordatorios] Agente ${agentEmail} no pertenece al tenant ${tenantId} — rechazado`);
         return res.status(403).json({ error: "El agente no pertenece a esta cuenta." });
       }
+      console.log(`[recordatorios] Agente ${agentEmail} validado OK`);
     }
 
     const payload = {
@@ -687,14 +692,13 @@ setInterval(procesarRecordatoriosPendientes, 5 * 60 * 1000);
 setTimeout(procesarRecordatoriosPendientes, 30 * 1000);
 
 // ── Health ────────────────────────────────────────────────────
-const healthRes = () => ({ status: "ok", version: "2.5.2", ts: new Date().toISOString() });
+const healthRes = () => ({ status: "ok", version: "2.5.3", ts: new Date().toISOString() });
 app.get("/",           (req, res) => res.json(healthRes()));
 app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
-// ── START ─────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.2 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.3 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
   console.log(`   POST http://localhost:${PORT}/api/recordatorios`);
