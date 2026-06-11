@@ -532,9 +532,13 @@ app.post("/api/recordatorios", async (req, res) => {
     if (agentEmail) {
       const agentRows = await sbQuery(
         "agents",
-        `data->>email=eq.${encodeURIComponent(agentEmail)}&tenant_id=eq.${tenantId}&select=id&limit=1`
+        `tenant_id=eq.${tenantId}&select=id,data&limit=50`
       );
-      if (agentRows.length === 0) {
+      const perteneceAlTenant = agentRows.some(r => {
+        const d = typeof r.data === "object" ? r.data : JSON.parse(r.data || "{}");
+        return d?.email === agentEmail;
+      });
+      if (!perteneceAlTenant) {
         console.warn(`[recordatorios] Agente ${agentEmail} no pertenece al tenant ${tenantId} — rechazado`);
         return res.status(403).json({ error: "El agente no pertenece a esta cuenta." });
       }
@@ -683,14 +687,14 @@ setInterval(procesarRecordatoriosPendientes, 5 * 60 * 1000);
 setTimeout(procesarRecordatoriosPendientes, 30 * 1000);
 
 // ── Health ────────────────────────────────────────────────────
-const healthRes = () => ({ status: "ok", version: "2.5.1", ts: new Date().toISOString() });
+const healthRes = () => ({ status: "ok", version: "2.5.2", ts: new Date().toISOString() });
 app.get("/",           (req, res) => res.json(healthRes()));
 app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
 // ── START ─────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.1 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.2 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
   console.log(`   POST http://localhost:${PORT}/api/recordatorios`);
