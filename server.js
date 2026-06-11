@@ -561,8 +561,10 @@ app.post("/api/recordatorios", async (req, res) => {
       fecha_envio:           fecha_envio,
       estado:                "pendiente",
       canal:                 "email",
-      modulo:                modulo,
+      // Nota: sin columna "modulo" — no existe en tas_recordatorios
     };
+
+    console.log(`[recordatorios] Insertando payload:`, JSON.stringify(payload));
 
     const sbRes = await fetch(`${SB_URL}/rest/v1/tas_recordatorios`, {
       method:  "POST",
@@ -577,6 +579,7 @@ app.post("/api/recordatorios", async (req, res) => {
 
     if (!sbRes.ok) {
       const e = await sbRes.text();
+      console.error(`[recordatorios] Supabase error ${sbRes.status}:`, e);
       return res.status(500).json({ error: "Error al guardar en Supabase", detalle: e });
     }
 
@@ -692,13 +695,13 @@ setInterval(procesarRecordatoriosPendientes, 5 * 60 * 1000);
 setTimeout(procesarRecordatoriosPendientes, 30 * 1000);
 
 // ── Health ────────────────────────────────────────────────────
-const healthRes = () => ({ status: "ok", version: "2.5.3", ts: new Date().toISOString() });
+const healthRes = () => ({ status: "ok", version: "2.5.4", ts: new Date().toISOString() });
 app.get("/",           (req, res) => res.json(healthRes()));
 app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.3 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.4 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
   console.log(`   POST http://localhost:${PORT}/api/recordatorios`);
