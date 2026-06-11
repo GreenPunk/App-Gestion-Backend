@@ -327,14 +327,17 @@ async function buildTenantContext(tenantId) {
  */
 app.post("/api/chat", async (req, res) => {
   try {
-    const { mensaje, tenantId, agentEmail, historial = [], contexto = null } = req.body;
+    const { mensaje, tenantId, agentEmail, agentRole, historial = [], contexto = null } = req.body;
 
     if (!mensaje || typeof mensaje !== "string") {
       return res.status(400).json({ error: "Falta el campo 'mensaje'" });
     }
 
+    const esSuperadmin = agentRole === "superadmin";
+
     // Verificar que el módulo agenteIA esté habilitado para este tenant
-    if (tenantId) {
+    // El superadmin puede operar en cualquier tenant sin restricción de módulos
+    if (tenantId && !esSuperadmin) {
       const tenantRows = await sbQuery("tenants", `id=eq.${tenantId}&select=modulos`);
       const modulos = tenantRows[0]?.modulos;
       if (Array.isArray(modulos) && !modulos.includes("agenteIA")) {
@@ -516,21 +519,23 @@ app.post("/api/generar-docx", upload.single("plantilla"), (req, res) => {
 app.post("/api/recordatorios", async (req, res) => {
   try {
     const {
-      tenantId, agentEmail, agentNombre, agentTgId,
+      tenantId, agentEmail, agentNombre, agentRole, agentTgId,
       asunto, mensaje, fecha_envio,
       destino_nombre, destino_email, destino_tel,
-      modulo = "agenteIA",
     } = req.body;
 
-    console.log(`[recordatorios] POST recibido — tenant=${tenantId} agent=${agentEmail} asunto="${asunto}"`);
+    console.log(`[recordatorios] POST recibido — tenant=${tenantId} agent=${agentEmail} role=${agentRole} asunto="${asunto}"`);
 
     if (!tenantId)       return res.status(400).json({ error: "Falta tenantId" });
     if (!asunto)         return res.status(400).json({ error: "Falta asunto" });
     if (!fecha_envio)    return res.status(400).json({ error: "Falta fecha_envio" });
     if (!destino_nombre) return res.status(400).json({ error: "Falta destino_nombre" });
 
+    const esSuperadmin = agentRole === "superadmin";
+
     // ── Validar que el agentEmail pertenece al tenantId declarado ─
-    if (agentEmail) {
+    // El superadmin puede crear recordatorios en cualquier tenant sin validación.
+    if (agentEmail && !esSuperadmin) {
       const agentRows = await sbQuery(
         "agents",
         `tenant_id=eq.${tenantId}&select=id,data&limit=50`
@@ -547,6 +552,8 @@ app.post("/api/recordatorios", async (req, res) => {
         return res.status(403).json({ error: "El agente no pertenece a esta cuenta." });
       }
       console.log(`[recordatorios] Agente ${agentEmail} validado OK`);
+    } else if (esSuperadmin) {
+      console.log(`[recordatorios] Superadmin ${agentEmail} — validación de tenant salteada`);
     }
 
     const payload = {
@@ -695,13 +702,13 @@ setInterval(procesarRecordatoriosPendientes, 5 * 60 * 1000);
 setTimeout(procesarRecordatoriosPendientes, 30 * 1000);
 
 // ── Health ────────────────────────────────────────────────────
-const healthRes = () => ({ status: "ok", version: "2.5.4", ts: new Date().toISOString() });
+const healthRes = () => ({ status: "ok", version: "2.5.5", ts: new Date().toISOString() });
 app.get("/",           (req, res) => res.json(healthRes()));
 app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.4 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.5 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
   console.log(`   POST http://localhost:${PORT}/api/recordatorios`);
