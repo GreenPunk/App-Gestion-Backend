@@ -19,6 +19,7 @@ const Docxtemplater = require("docxtemplater");
 const path          = require("path");
 const fs            = require("fs");
 const Anthropic     = require("@anthropic-ai/sdk");
+const crearModuloLeads = require("./emp-leads.js");
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
@@ -74,6 +75,11 @@ async function sbQuery(table, params = "") {
     return await res.json();
   } catch { return []; }
 }
+
+// ── Módulo Leads Emprendimientos ────────────────────────────
+const { router: leadsRouter, iniciarPolling } = crearModuloLeads({ SB_URL, SB_KEY, sbQuery });
+app.use("/api", leadsRouter);
+iniciarPolling(3); // cada 3 minutos
 
 // ── Construir contexto del tenant para el agente IA ──────────
 //
