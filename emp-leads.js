@@ -18,14 +18,14 @@ const REMITENTE_LEADS = "info@dicio.com.ar";
 module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
   const router = express.Router();
 
-  async function sbWrite(method, table, body, query = "") {
+  async function sbWrite(method, table, body, query = "", prefer = "return=representation") {
     const res = await fetch(`${SB_URL}/rest/v1/${table}${query ? "?" + query : ""}`, {
       method,
       headers: {
         apikey: SB_KEY,
         Authorization: `Bearer ${SB_KEY}`,
         "Content-Type": "application/json",
-        Prefer: "return=representation",
+        Prefer: prefer,
       },
       body: JSON.stringify(body),
     });
@@ -126,7 +126,8 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
     const rows = await sbWrite(
       "POST", "emp_leads",
       { tenant_id: tenantId, estado_id: estadoInicialId, ...lead },
-      "on_conflict=tenant_id,lead_id_externo"
+      "on_conflict=tenant_id,lead_id_externo",
+      "resolution=merge-duplicates,return=representation"
     );
     const row = rows[0];
     if (!row) return null;
@@ -174,9 +175,16 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
               const row = await upsertLead(tenantId, lead);
               console.log(`[emp-leads] Procesado lead_id_externo=${lead.lead_id_externo} → fila id=${row?.id}`);
             }
-            await client.messageFlagsAdd(uid, ["\\Seen"]);
           } catch (e) {
             console.error(`[emp-leads] Error procesando uid=${uid}:`, e.message);
+          } finally {
+            // Se marca como leído SIEMPRE, haya o no error arriba, para que un
+            // fallo puntual no deje el mail en loop infinito de reprocesamiento.
+            try {
+              await client.messageFlagsAdd(uid, ["\\Seen"]);
+            } catch (flagErr) {
+              console.error(`[emp-leads] No se pudo marcar como leído uid=${uid}:`, flagErr.message);
+            }
           }
         }
       } finally {
