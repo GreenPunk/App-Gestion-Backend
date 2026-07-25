@@ -5,9 +5,10 @@
  * ─────────────────────────────────────────────────────────────
  *
  *  ENDPOINTS:
- *    POST /api/generar-docx   → recibe plantilla + datos, devuelve .docx relleno
- *    POST /api/chat           → chat IA con contexto del tenant (streaming SSE)
- *    GET  /api/health         → estado del servidor
+ *    POST /api/generar-docx             → recibe plantilla + datos, devuelve .docx relleno
+ *    POST /api/chat                     → chat IA con contexto del tenant (streaming SSE)
+ *    POST /api/consumos/extraer-factura → extrae datos de una factura (Edenor/Naturgy/Visa) con IA
+ *    GET  /api/health                   → estado del servidor
  * ─────────────────────────────────────────────────────────────
  */
 
@@ -19,7 +20,6 @@ const Docxtemplater = require("docxtemplater");
 const path          = require("path");
 const fs            = require("fs");
 const Anthropic     = require("@anthropic-ai/sdk");
-const crearModuloLeads = require("./emp-leads.js");
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
@@ -57,6 +57,17 @@ const upload = multer({
   },
 });
 
+// Multer: recibe la foto/PDF de una factura de servicios (Consumos) en memoria
+const uploadFactura = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const tiposPermitidos = ["image/jpeg", "image/png", "image/webp", "application/pdf"];
+    if (tiposPermitidos.includes(file.mimetype)) cb(null, true);
+    else cb(new Error("Solo se permiten imágenes (jpg/png/webp) o PDF"));
+  },
+});
+
 // ── Supabase fetch helper (server-side) ───────────────────────
 const SB_URL = process.env.SUPABASE_URL     || "";
 const SB_KEY = process.env.SUPABASE_ANON_KEY || "";
@@ -75,11 +86,6 @@ async function sbQuery(table, params = "") {
     return await res.json();
   } catch { return []; }
 }
-
-// ── Módulo Leads Emprendimientos ────────────────────────────
-const { router: leadsRouter, iniciarPolling } = crearModuloLeads({ SB_URL, SB_KEY, sbQuery });
-app.use("/api", leadsRouter);
-iniciarPolling(3); // cada 3 minutos
 
 // ── Construir contexto del tenant para el agente IA ──────────
 //
@@ -502,6 +508,124 @@ app.post("/api/generar-docx", upload.single("plantilla"), (req, res) => {
   }
 });
 
+// ── ENDPOINT /api/consumos/extraer-factura ─────────────────────
+// Módulo "Consumos de Servicios" (personal, Alex). Recibe la foto/PDF de una
+// factura + la fuente (edenor/naturgy/visa), le pide a la IA que devuelva
+// SOLO un JSON con los campos de esa factura (ver prompts abajo — mismo
+// texto que `prompts_extraccion_facturas.md`), y se lo devuelve al frontend
+// ya parseado para precargar el formulario de confirmación. No guarda nada
+// en Supabase acá — el insert en `serv_facturas` lo hace el frontend recién
+// cuando Ale confirma, después de revisar/corregir los valores.
+const PROMPTS_EXTRACCION_FACTURA = {
+  edenor: `Sos un extractor de datos de facturas de electricidad de Edenor (Argentina).
+Te paso la imagen o PDF de una factura. Devolvé ÚNICAMENTE un objeto JSON,
+sin texto antes ni después, sin backticks, con esta forma exacta:
+
+{
+  "anio": <número, año del período facturado>,
+  "mes": <número 1-12, mes del período facturado>,
+  "total": <número, importe total a pagar>,
+  "consumo_fijo": <número, cargo fijo del período (a veces llamado "cargo fijo" o "término fijo")>,
+  "consumo_variable": <número, cargo por consumo/energía (a veces "término energía" o similar) — SIN incluir impuestos>,
+  "kwh_consumidos": <número, cantidad de kWh facturados en el período>,
+  "valor_kwh": <número, valor unitario del kWh si figura>,
+  "impuestos": <número, suma de IVA + impuestos nacionales/provinciales>,
+  "tasa_municipal": <número, tasa/alumbrado municipal si figura por separado>,
+  "otros": <número, cualquier otro cargo que no encaje en los anteriores (mora, intereses, ajustes) — sumado>,
+  "periodo_desde": <"YYYY-MM-DD", inicio del período facturado si figura>,
+  "periodo_hasta": <"YYYY-MM-DD", fin del período facturado si figura>
+}
+
+Si un campo no aparece en la factura o no podés leerlo con confianza, poné null en ese campo — no inventes valores. No agregues campos extra.`,
+
+  naturgy: `Sos un extractor de datos de facturas de gas de Naturgy (Argentina). Te paso
+la imagen o PDF de una factura. Devolvé ÚNICAMENTE un objeto JSON, sin texto
+antes ni después, sin backticks, con esta forma exacta:
+
+{
+  "anio": <número, año del período facturado>,
+  "mes": <número 1-12, mes del período facturado>,
+  "total": <número, importe total a pagar>,
+  "consumo_fijo": <número, cargo fijo del período — null si la factura no lo desglosa por separado>,
+  "consumo_variable": <número, cargo por consumo de gas — null si la factura no lo desglosa por separado>,
+  "m3_consumidos": <número, metros cúbicos facturados en el período>,
+  "impuestos": <número, suma de IVA + impuestos nacionales/provinciales>,
+  "tasa_municipal": <número, tasa municipal si figura por separado>,
+  "otros": <número, cargos adicionales — mora, carta documento, intereses, ajustes — sumado>,
+  "periodo_desde": <"YYYY-MM-DD", inicio del período facturado si figura>,
+  "periodo_hasta": <"YYYY-MM-DD", fin del período facturado si figura>
+}
+
+IMPORTANTE: la cantidad de personas por unidad NO está en la factura — ese dato lo carga Ale a mano en el formulario, no lo completes vos.
+
+Si un campo no aparece en la factura o no podés leerlo con confianza, poné null en ese campo — no inventes valores. No agregues campos extra.`,
+
+  visa: `Sos un extractor de datos de resúmenes de tarjeta Visa (Argentina), para
+seguir el pago del alquiler/gastos en dólares. Te paso la imagen o PDF del
+resumen. Devolvé ÚNICAMENTE un objeto JSON, sin texto antes ni después, sin
+backticks, con esta forma exacta:
+
+{
+  "anio": <número, año del cierre>,
+  "mes": <número 1-12, mes del cierre>,
+  "total_pesos": <número, total del resumen en pesos argentinos>,
+  "total_dolares": <número, total en dólares si figura algún consumo/cuota en esa moneda>,
+  "cotizacion_aplicada": <número, tipo de cambio usado para convertir el consumo en dólares a pesos, si figura>,
+  "fecha_cierre": <"YYYY-MM-DD", fecha de cierre del resumen>,
+  "fecha_vencimiento": <"YYYY-MM-DD", fecha de vencimiento del pago>
+}
+
+Si un campo no aparece en el resumen o no podés leerlo con confianza, poné null en ese campo — no inventes valores. No agregues campos extra.`,
+};
+
+app.post("/api/consumos/extraer-factura", uploadFactura.single("factura"), async (req, res) => {
+  try {
+    const { fuente } = req.body;
+    if (!req.file) {
+      return res.status(400).json({ error: "No se recibió el archivo (campo: factura)" });
+    }
+    const prompt = PROMPTS_EXTRACCION_FACTURA[fuente];
+    if (!prompt) {
+      return res.status(400).json({ error: `Fuente desconocida: '${fuente}'. Usar "edenor", "naturgy" o "visa".` });
+    }
+
+    const esPdf = req.file.mimetype === "application/pdf";
+    const base64 = req.file.buffer.toString("base64");
+
+    const bloqueArchivo = esPdf
+      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } }
+      : { type: "image", source: { type: "base64", media_type: req.file.mimetype, data: base64 } };
+
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-5",
+      max_tokens: 1000,
+      messages: [
+        { role: "user", content: [bloqueArchivo, { type: "text", text: prompt }] },
+      ],
+    });
+
+    const textoResp = response.content
+      .filter(b => b.type === "text")
+      .map(b => b.text)
+      .join("\n")
+      .trim();
+    const limpio = textoResp.replace(/```json|```/g, "").trim();
+
+    let campos;
+    try {
+      campos = JSON.parse(limpio);
+    } catch {
+      return res.status(422).json({ error: "La IA no devolvió un JSON válido", respuesta_cruda: textoResp });
+    }
+
+    res.json({ campos });
+
+  } catch (err) {
+    console.error("[extraer-factura] Error:", err.message);
+    res.status(500).json({ error: "Error al extraer datos de la factura", detalle: err.message });
+  }
+});
+
 // ── ENDPOINT /api/recordatorios ───────────────────────────────
 /**
  * POST /api/recordatorios
@@ -717,6 +841,7 @@ app.listen(PORT, () => {
   console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.5 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
+  console.log(`   POST http://localhost:${PORT}/api/consumos/extraer-factura`);
   console.log(`   POST http://localhost:${PORT}/api/recordatorios`);
   console.log(`   GET  http://localhost:${PORT}/api/health\n`);
   if (!process.env.ANTHROPIC_API_KEY) console.warn("⚠️  ANTHROPIC_API_KEY no configurada — /api/chat no va a funcionar");
