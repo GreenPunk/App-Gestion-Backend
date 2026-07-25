@@ -527,14 +527,30 @@ sin texto antes ni después, sin backticks, con esta forma exacta:
   "total": <número, importe total a pagar>,
   "consumo_fijo": <número, cargo fijo del período (a veces llamado "cargo fijo" o "término fijo")>,
   "consumo_variable": <número, cargo por consumo/energía (a veces "término energía" o similar) — SIN incluir impuestos>,
-  "kwh_consumidos": <número, cantidad de kWh facturados en el período>,
-  "valor_kwh": <número, valor unitario del kWh si figura>,
+  "kwh_consumidos": <número, cantidad de kWh facturados en el período — tomalo de "Consumo" en el detalle del medidor si figura ahí>,
+  "valor_kwh": <número, valor unitario PROMEDIO del kWh en el período>,
   "impuestos": <número, suma de IVA + impuestos nacionales/provinciales>,
   "tasa_municipal": <número, tasa/alumbrado municipal si figura por separado>,
   "otros": <número, cualquier otro cargo que no encaje en los anteriores (mora, intereses, ajustes) — sumado>,
   "periodo_desde": <"YYYY-MM-DD", inicio del período facturado si figura>,
   "periodo_hasta": <"YYYY-MM-DD", fin del período facturado si figura>
 }
+
+IMPORTANTE — cargo variable con tarifa dividida en tramos: en la sección "Detalle de
+la liquidación" (normalmente en la segunda página), el cargo variable a veces no viene
+como un único número sino como una fórmula del tipo:
+  ((X kWh x (N días a $P) / N) + (Y kWh x (M días a $Q) / M))
+Esto pasa cuando hubo un cambio de tarifa dentro del período facturado, y cada término
+representa un tramo con su propio precio ($P y $Q son el valor por kWh de cada tramo,
+no un monto total). Si encontrás la factura en este formato:
+  - "kwh_consumidos" = X + Y (suma de los kWh de todos los tramos). Verificá que
+    coincida con el "Consumo" del detalle del medidor si también figura ahí.
+  - "consumo_variable" = el resultado final de esa fórmula (el monto total en $ al
+    final de la cuenta), no la suma de las X e Y.
+  - "valor_kwh" = promedio ponderado = consumo_variable / kwh_consumidos, redondeado
+    a 2 decimales (NO uses P o Q solos, son precios de tramos parciales).
+Si en cambio la factura muestra un único valor de $/kWh sin tramos, usá ese directamente
+como "valor_kwh".
 
 Si un campo no aparece en la factura o no podés leerlo con confianza, poné null en ese campo — no inventes valores. No agregues campos extra.`,
 
