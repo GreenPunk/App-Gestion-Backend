@@ -1,19 +1,22 @@
 /**
  * ─────────────────────────────────────────────────────────────
- *  MÓDULO — Leads Emprendimientos
- *  IMAP polling (Gmail) + parser + reparto equitativo + endpoints
+ * MÓDULO — Leads Emprendimientos
+ * IMAP polling (Gmail) + parser + reparto equitativo + endpoints
  * ─────────────────────────────────────────────────────────────
  */
-
-const express       = require("express");
-const crypto        = require("crypto");
-const { ImapFlow }  = require("imapflow");
+const express = require("express");
+const crypto = require("crypto");
+const { ImapFlow } = require("imapflow");
 const { simpleParser } = require("mailparser");
 
 const CASILLA_TENANT = {
   "nataliaalvarez.inmobiliaria@gmail.com": "6626aa9e-7f08-46a8-8692-4e2f9b69c6a3",
 };
+
 const REMITENTE_LEADS = "info@dicio.com.ar";
+
+// Fase 12 — nombre del estado al que pasa un lead que respondió por mail.
+const ESTADO_RESPUESTA_NOMBRE = "Respuesta de lead contactado por mail";
 
 module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
   const router = express.Router();
@@ -68,14 +71,14 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
     if (estadoExterno) console.log(`[emp-leads] Estado externo del lead (informativo): "${estadoExterno}"`);
 
     return {
-      lead_id_externo:      toUuid(leadIdRaw),
-      nombre:                get("Nombre"),
-      email:                 get("Email"),
-      telefono:              get("Telefono") || get("Teléfono"),
-      fuente:                get("Fuente"),
-      emprendimiento:        parsedMail.from?.value?.[0]?.name || null,
-      fecha_creado_externo:  parseFechaArg(get("Creado")),
-      mail_raw:              text,
+      lead_id_externo: toUuid(leadIdRaw),
+      nombre: get("Nombre"),
+      email: get("Email"),
+      telefono: get("Telefono") || get("Teléfono"),
+      fuente: get("Fuente"),
+      emprendimiento: parsedMail.from?.value?.[0]?.name || null,
+      fecha_creado_externo: parseFechaArg(get("Creado")),
+      mail_raw: text,
     };
   }
 
@@ -87,6 +90,26 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
     const iso = `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}T${h.padStart(2, "0")}:${mi}:${s}-03:00`;
     const dt = new Date(iso);
     return isNaN(dt.getTime()) ? null : dt.toISOString();
+  }
+
+  // Fase 12 — recorta firmas y quoted-replies del cuerpo de una respuesta de
+  // lead antes de guardarlo. Best-effort: si no encuentra ningún marcador
+  // conocido, guarda el texto completo (mejor de más que de menos).
+  function limpiarTextoRespuesta(text) {
+    if (!text) return text || "";
+    const marcadores = [
+      /\n\s*El .{0,120} escribió:\s*\n/i,   // Gmail en español
+      /\n\s*On .{0,120} wrote:\s*\n/i,       // Gmail en inglés
+      /\n-{2,}\s*Mensaje original\s*-{2,}/i, // Outlook en español
+      /\n-{2,}\s*Original Message\s*-{2,}/i, // Outlook en inglés
+      /\n>{1}.*/s,                            // primera línea citada con ">"
+    ];
+    let out = text;
+    for (const re of marcadores) {
+      const m = out.match(re);
+      if (m && m.index > 0) out = out.slice(0, m.index);
+    }
+    return out.trim();
   }
 
   async function elegirAgenteEquitativo(tenantId) {
@@ -145,11 +168,64 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
     return row;
   }
 
+  // ── Fase 12 — captura de respuestas de leads por mail ──────────────────
+
+  async function buscarLeadPorEmail(tenantId, email) {
+    if (!email) return null;
+    const rows = await sbQuery(
+      "emp_leads",
+      `tenant_id=eq.${tenantId}&email=ilike.${encodeURIComponent(email)}&select=id,agente_id,estado_id,email&order=created_at.desc&limit=1`
+    );
+    return rows[0] || null;
+  }
+
+  // Query-o-crea el estado "Respuesta de lead contactado por mail". Si tiene
+  // que crearlo, corre una única vez ganado/perdido +1 en orden para hacerle
+  // lugar antes de ellos (idempotente: si ya existe, no vuelve a tocar nada).
+  async function buscarOCrearEstadoRespuesta(tenantId) {
+    const existentes = await sbQuery(
+      "emp_lead_estados",
+      `tenant_id=eq.${tenantId}&nombre=eq.${encodeURIComponent(ESTADO_RESPUESTA_NOMBRE)}&select=id`
+    );
+    if (existentes[0]) return existentes[0].id;
+
+    const actuales = await sbQuery("emp_lead_estados", `tenant_id=eq.${tenantId}&select=id,orden&order=orden.asc`);
+    const aCorrer = actuales.filter(e => e.orden >= 6);
+    for (const e of aCorrer) {
+      await sbWrite("PATCH", `emp_lead_estados?id=eq.${e.id}`, { orden: e.orden + 1 });
+    }
+
+    const rows = await sbWrite("POST", "emp_lead_estados", {
+      tenant_id: tenantId,
+      nombre: ESTADO_RESPUESTA_NOMBRE,
+      orden: 6,
+      color: "#ea580c",
+      es_final: false,
+    });
+    console.log(`[emp-leads] Estado "${ESTADO_RESPUESTA_NOMBRE}" creado (id=${rows[0]?.id})`);
+    return rows[0]?.id;
+  }
+
+  async function procesarRespuestaLead(tenantId, lead, parsedMail) {
+    const estadoRespuestaId = await buscarOCrearEstadoRespuesta(tenantId);
+    const cuerpo = limpiarTextoRespuesta(parsedMail.text);
+
+    await sbWrite("PATCH", `emp_leads?id=eq.${lead.id}`, {
+      estado_id: estadoRespuestaId,
+      ultima_respuesta_mail: cuerpo,
+      ultima_respuesta_mail_fecha: new Date().toISOString(),
+    });
+
+    // Nunca se reasigna: la respuesta queda con el agente que ya tenía el lead.
+    await addEvento(lead.id, lead.agente_id, "mail", cuerpo, lead.estado_id, estadoRespuestaId);
+  }
+
   async function pollearCasilla(casilla, tenantId) {
     if (!process.env.GMAIL_APP_PASSWORD) {
       console.warn("[emp-leads] GMAIL_APP_PASSWORD no configurada — polling salteado");
       return;
     }
+
     const client = new ImapFlow({
       host: "imap.gmail.com",
       port: 993,
@@ -162,18 +238,33 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
       await client.connect();
       const lock = await client.getMailboxLock("INBOX");
       try {
-        const uids = await client.search({ seen: false, from: REMITENTE_LEADS });
+        // Fase 12: ya no filtramos por REMITENTE_LEADS acá — necesitamos ver
+        // TODOS los mails no leídos para detectar también las respuestas de
+        // leads existentes. El filtro por remitente se hace mail a mail abajo.
+        const uids = await client.search({ seen: false });
         if (uids.length === 0) return;
-        console.log(`[emp-leads] ${uids.length} mail(s) nuevo(s) de ${REMITENTE_LEADS}`);
+        console.log(`[emp-leads] ${uids.length} mail(s) sin leer`);
 
         for (const uid of uids) {
           try {
             const msg = await client.fetchOne(uid, { source: true });
             const parsed = await simpleParser(msg.source);
-            const lead = parsearLeadEmail(parsed);
-            if (lead) {
-              const row = await upsertLead(tenantId, lead);
-              console.log(`[emp-leads] Procesado lead_id_externo=${lead.lead_id_externo} → fila id=${row?.id}`);
+            const remitente = (parsed.from?.value?.[0]?.address || "").toLowerCase().trim();
+
+            if (remitente === REMITENTE_LEADS) {
+              const lead = parsearLeadEmail(parsed);
+              if (lead) {
+                const row = await upsertLead(tenantId, lead);
+                console.log(`[emp-leads] Procesado lead_id_externo=${lead.lead_id_externo} → fila id=${row?.id}`);
+              }
+            } else if (remitente && remitente !== casilla.toLowerCase()) {
+              // Fase 12: ¿es la respuesta de un lead ya cargado para este tenant?
+              const leadExistente = await buscarLeadPorEmail(tenantId, remitente);
+              if (leadExistente) {
+                await procesarRespuestaLead(tenantId, leadExistente, parsed);
+                console.log(`[emp-leads] Respuesta de mail registrada — lead id=${leadExistente.id} (${remitente})`);
+              }
+              // si no matchea ningún lead conocido, se ignora — no es leads-relacionado
             }
           } catch (e) {
             console.error(`[emp-leads] Error procesando uid=${uid}:`, e.message);
@@ -215,7 +306,7 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
       let q = `tenant_id=eq.${tenant_id}&select=*&order=created_at.desc`;
       if (estado_id) q += `&estado_id=eq.${estado_id}`;
       if (agente_id) q += `&agente_id=eq.${agente_id}`;
-      if (fuente)    q += `&fuente=eq.${encodeURIComponent(fuente)}`;
+      if (fuente) q += `&fuente=eq.${encodeURIComponent(fuente)}`;
       res.json(await sbQuery("emp_leads", q));
     } catch (e) {
       res.status(500).json({ error: "Error interno", detalle: e.message });
@@ -226,10 +317,8 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
     try {
       const { estado_nuevo_id, agente_id } = req.body;
       if (!estado_nuevo_id) return res.status(400).json({ error: "Falta estado_nuevo_id" });
-
       const actual = await sbQuery("emp_leads", `id=eq.${req.params.id}&select=estado_id`);
       const estadoAnteriorId = actual[0]?.estado_id || null;
-
       await sbWrite("PATCH", `emp_leads?id=eq.${req.params.id}`, { estado_id: estado_nuevo_id });
       await addEvento(req.params.id, agente_id || null, "cambio_estado", null, estadoAnteriorId, estado_nuevo_id);
       res.json({ ok: true });
@@ -285,9 +374,7 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
     try {
       const { tenant_id } = req.query;
       if (!tenant_id) return res.status(400).json({ error: "Falta tenant_id" });
-
       const leads = await sbQuery("emp_leads", `tenant_id=eq.${tenant_id}&select=fuente,estado_id,agente_id,created_at`);
-
       const porFuente = {};
       const porEstado = {};
       const porAgente = {};
@@ -296,7 +383,6 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
         porEstado[l.estado_id] = (porEstado[l.estado_id] || 0) + 1;
         porAgente[l.agente_id] = (porAgente[l.agente_id] || 0) + 1;
       });
-
       res.json({ total: leads.length, porFuente, porEstado, porAgente });
     } catch (e) {
       res.status(500).json({ error: "Error interno", detalle: e.message });
@@ -311,7 +397,6 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
       const dataNueva = { ...dataActual };
       if (color !== undefined) dataNueva.color = color;
       if (activo_leads !== undefined) dataNueva.activo_leads = activo_leads;
-
       await sbWrite("PATCH", `agents?id=eq.${req.params.id}`, { data: dataNueva });
       res.json({ ok: true });
     } catch (e) {
