@@ -8,6 +8,9 @@
  *    POST /api/generar-docx             → recibe plantilla + datos, devuelve .docx relleno
  *    POST /api/chat                     → chat IA con contexto del tenant (streaming SSE)
  *    POST /api/consumos/extraer-factura → extrae datos de una factura (Edenor/Naturgy/Visa) con IA
+ *    POST /api/recordatorios            → crea un recordatorio (email + WhatsApp)
+ *    GET  /api/icl/estado               → estado del cache de ICL (último mes, cupo de API usado)
+ *    POST /api/icl/actualizar           → trae meses faltantes de ICL desde ARquilerAPI y los cachea
  *    GET  /api/health                   → estado del servidor
  * ─────────────────────────────────────────────────────────────
  */
@@ -73,6 +76,11 @@ const uploadFactura = multer({
 const SB_URL = process.env.SUPABASE_URL     || "";
 const SB_KEY = process.env.SUPABASE_ANON_KEY || "";
 
+// Service role key — SOLO para escribir en tablas de solo-lectura-pública
+// como alq_icl_mensual / alq_icl_api_usage (RLS sin policy de insert/update
+// para la anon key). Nunca se expone al frontend.
+const SB_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
 async function sbQuery(table, params = "") {
   if (!SB_URL || !SB_KEY) return [];
   try {
@@ -88,10 +96,158 @@ async function sbQuery(table, params = "") {
   } catch { return []; }
 }
 
+// Upsert server-side con service role key (bypassea RLS). Usado solo por
+// los endpoints de ICL — no reemplaza a sbQuery para el resto del sistema.
+async function sbUpsertService(table, rows, conflictColumn) {
+  if (!SB_URL || !SB_SERVICE_KEY) throw new Error("SUPABASE_SERVICE_ROLE_KEY no configurada");
+  const res = await fetch(`${SB_URL}/rest/v1/${table}?on_conflict=${conflictColumn}`, {
+    method:  "POST",
+    headers: {
+      "apikey":        SB_SERVICE_KEY,
+      "Authorization": `Bearer ${SB_SERVICE_KEY}`,
+      "Content-Type":  "application/json",
+      "Prefer":        "resolution=merge-duplicates,return=representation",
+    },
+    body: JSON.stringify(rows),
+  });
+  if (!res.ok) {
+    const e = await res.text();
+    throw new Error(`Supabase upsert error ${res.status}: ${e}`);
+  }
+  return await res.json();
+}
+
 // ── Módulo Leads Emprendimientos ────────────────────────────
 const { router: leadsRouter, iniciarPolling } = crearModuloLeads({ SB_URL, SB_KEY, sbQuery });
 app.use("/api", leadsRouter);
 iniciarPolling(3); // cada 3 minutos
+
+// ── Índice ICL — ARquilerAPI (RapidAPI) ──────────────────────
+//
+// Cachea la serie mensual de ICL en Supabase (alq_icl_mensual) para no
+// depender del plan Basic de RapidAPI (15 requests/mes, hard limit).
+// El frontend (ModuloAlquileres.jsx) hace todos los cálculos por contrato
+// localmente contra esa tabla — este módulo solo la mantiene al día.
+//
+// Salvaguarda de cupo: se frena en 14 usos/mes (dejando 1 de margen sobre
+// el límite real de 15) y nunca llama a la API si ya tiene el mes en curso
+// cacheado.
+
+const RAPIDAPI_ICL_KEY  = process.env.RAPIDAPI_ICL_KEY  || "";
+const RAPIDAPI_ICL_HOST = process.env.RAPIDAPI_ICL_HOST || "arquilerapi1.p.rapidapi.com";
+const ICL_CUPO_MENSUAL  = 15;
+const ICL_CUPO_FRENO    = 14; // por encima de esto, el backend rechaza el llamado
+const ICL_DESDE_DEFAULT = "2024-09-01"; // arranque si la tabla está vacía (misma fecha que el ALQ_INDICES hardcodeado anterior)
+
+const mesActualIcl = () => new Date().toISOString().slice(0, 7); // "2026-07"
+
+async function iclUsosDelMes(mes) {
+  const rows = await sbQuery("alq_icl_api_usage", `mes=eq.${mes}&select=usos&limit=1`);
+  return rows[0]?.usos || 0;
+}
+
+// GET /api/icl/estado — para que el frontend pinte el botón (pausado/activo/agotado)
+app.get("/api/icl/estado", async (req, res) => {
+  try {
+    const ultimos = await sbQuery("alq_icl_mensual", "select=mes,actualizado_en&order=mes.desc&limit=1");
+    const mes = mesActualIcl();
+    const usos = await iclUsosDelMes(mes);
+    res.json({
+      ultimoMesCacheado: ultimos[0]?.mes || null,
+      actualizadoEn:     ultimos[0]?.actualizado_en || null,
+      mesActual:         mes,
+      alDia:             ultimos[0]?.mes === mes,
+      usosEsteMes:       usos,
+      cupoMensual:       ICL_CUPO_MENSUAL,
+      cupoAgotado:       usos >= ICL_CUPO_FRENO,
+    });
+  } catch (err) {
+    console.error("[icl] Error en /estado:", err.message);
+    res.status(500).json({ error: "Error interno", detalle: err.message });
+  }
+});
+
+// POST /api/icl/actualizar — trae los meses faltantes desde ARquilerAPI y los cachea
+app.post("/api/icl/actualizar", async (req, res) => {
+  try {
+    if (!RAPIDAPI_ICL_KEY) return res.status(500).json({ error: "RAPIDAPI_ICL_KEY no configurada" });
+    if (!SB_SERVICE_KEY)   return res.status(500).json({ error: "SUPABASE_SERVICE_ROLE_KEY no configurada" });
+
+    const mes  = mesActualIcl();
+    const usos = await iclUsosDelMes(mes);
+    if (usos >= ICL_CUPO_FRENO) {
+      console.warn(`[icl] Cupo mensual casi agotado (${usos}/${ICL_CUPO_MENSUAL}) — llamado rechazado`);
+      return res.status(429).json({ error: "Cupo mensual de la API casi agotado. Contactar a Ale.", usosEsteMes: usos, cupoMensual: ICL_CUPO_MENSUAL });
+    }
+
+    const ultimos  = await sbQuery("alq_icl_mensual", "select=mes&order=mes.desc&limit=1");
+    const ultimoMes = ultimos[0]?.mes || null;
+    if (ultimoMes === mes) {
+      console.log(`[icl] Ya está al día (${mes}) — no se llama a la API`);
+      return res.json({ ok: true, sinCambios: true, ultimoMesCacheado: ultimoMes });
+    }
+
+    // Fecha desde donde pedir: el mes siguiente al último cacheado, o el arranque por defecto
+    let desde = ICL_DESDE_DEFAULT;
+    if (ultimoMes) {
+      const [y, m] = ultimoMes.split("-").map(Number);
+      const sig = new Date(Date.UTC(y, m, 1)); // mes siguiente (m es 1-indexed -> ya suma uno)
+      desde = sig.toISOString().slice(0, 10);
+    }
+
+    console.log(`[icl] Llamando a ARquilerAPI — date=${desde} months=1 rate=icl`);
+    const apiRes = await fetch(`https://${RAPIDAPI_ICL_HOST}/calculate`, {
+      method:  "POST",
+      headers: {
+        "Content-Type":     "application/json",
+        "X-RapidAPI-Key":   RAPIDAPI_ICL_KEY,
+        "X-RapidAPI-Host":  RAPIDAPI_ICL_HOST,
+      },
+      body: JSON.stringify({ amount: 1, date: desde, months: 1, rate: "icl" }),
+    });
+
+    // Se incrementa el contador de uso siempre que se haga el llamado,
+    // haya salido bien o mal — es lo que cuenta RapidAPI.
+    await sbUpsertService("alq_icl_api_usage", [{ mes, usos: usos + 1, ultimo_uso: new Date().toISOString() }], "mes");
+
+    if (!apiRes.ok) {
+      const e = await apiRes.text();
+      console.error(`[icl] ARquilerAPI error ${apiRes.status}:`, e);
+      return res.status(502).json({ error: "Error al consultar ARquilerAPI", detalle: e });
+    }
+
+    const body = await apiRes.json();
+    if (!body?.success || !Array.isArray(body?.data)) {
+      console.error("[icl] Respuesta inesperada de ARquilerAPI:", JSON.stringify(body).slice(0, 300));
+      return res.status(502).json({ error: "Respuesta inesperada de ARquilerAPI" });
+    }
+
+    // El primer punto es la base (dif:0, es la fecha de arranque, no un mes real).
+    // Cada punto siguiente, con months:1, tiene su dif = variación de ese mes puntual.
+    const puntos = body.data.slice(1);
+    if (puntos.length === 0) {
+      console.log("[icl] La API no devolvió meses nuevos todavía");
+      return res.json({ ok: true, sinCambios: true, ultimoMesCacheado: ultimoMes });
+    }
+
+    const filas = puntos.map(p => ({
+      mes:            p.date.slice(0, 7),
+      pct_mensual:    p.dif,
+      valor_indice:   p.value,
+      estimado:       !!p.estimated,
+      actualizado_en: new Date().toISOString(),
+    }));
+
+    await sbUpsertService("alq_icl_mensual", filas, "mes");
+    console.log(`[icl] Cacheados ${filas.length} mes(es): ${filas.map(f => f.mes).join(", ")}`);
+
+    res.json({ ok: true, mesesActualizados: filas.map(f => f.mes), usosEsteMes: usos + 1, cupoMensual: ICL_CUPO_MENSUAL });
+
+  } catch (err) {
+    console.error("[icl] Error en /actualizar:", err.message);
+    res.status(500).json({ error: "Error interno", detalle: err.message });
+  }
+});
 
 // ── Construir contexto del tenant para el agente IA ──────────
 //
@@ -860,13 +1016,17 @@ app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.5.5 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.6.0 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
   console.log(`   POST http://localhost:${PORT}/api/consumos/extraer-factura`);
   console.log(`   POST http://localhost:${PORT}/api/recordatorios`);
+  console.log(`   GET  http://localhost:${PORT}/api/icl/estado`);
+  console.log(`   POST http://localhost:${PORT}/api/icl/actualizar`);
   console.log(`   GET  http://localhost:${PORT}/api/health\n`);
-  if (!process.env.ANTHROPIC_API_KEY) console.warn("⚠️  ANTHROPIC_API_KEY no configurada — /api/chat no va a funcionar");
-  if (!process.env.SUPABASE_URL)      console.warn("⚠️  SUPABASE_URL no configurada — contexto del agente estará vacío");
-  if (!process.env.RESEND_API_KEY)    console.warn("⚠️  RESEND_API_KEY no configurada — cron enviará emails en modo silencioso");
+  if (!process.env.ANTHROPIC_API_KEY)        console.warn("⚠️  ANTHROPIC_API_KEY no configurada — /api/chat no va a funcionar");
+  if (!process.env.SUPABASE_URL)             console.warn("⚠️  SUPABASE_URL no configurada — contexto del agente estará vacío");
+  if (!process.env.RESEND_API_KEY)           console.warn("⚠️  RESEND_API_KEY no configurada — cron enviará emails en modo silencioso");
+  if (!process.env.SUPABASE_SERVICE_ROLE_KEY) console.warn("⚠️  SUPABASE_SERVICE_ROLE_KEY no configurada — /api/icl/actualizar no va a poder escribir en Supabase");
+  if (!process.env.RAPIDAPI_ICL_KEY)          console.warn("⚠️  RAPIDAPI_ICL_KEY no configurada — /api/icl/actualizar no va a funcionar");
 });
