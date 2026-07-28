@@ -149,20 +149,40 @@ async function iclUsosDelMes(mes) {
 // GET /api/icl/estado — para que el frontend pinte el botón (pausado/activo/agotado)
 app.get("/api/icl/estado", async (req, res) => {
   try {
-    const ultimos = await sbQuery("alq_icl_mensual", "select=mes,actualizado_en&order=mes.desc&limit=1");
+    const ultimos = await sbQuery("alq_icl_mensual", "select=mes,pct_mensual,actualizado_en&order=mes.desc&limit=1");
     const mes = mesActualIcl();
     const usos = await iclUsosDelMes(mes);
     res.json({
-      ultimoMesCacheado: ultimos[0]?.mes || null,
-      actualizadoEn:     ultimos[0]?.actualizado_en || null,
-      mesActual:         mes,
-      alDia:             ultimos[0]?.mes === mes,
-      usosEsteMes:       usos,
-      cupoMensual:       ICL_CUPO_MENSUAL,
-      cupoAgotado:       usos >= ICL_CUPO_FRENO,
+      ultimoMesCacheado:   ultimos[0]?.mes || null,
+      ultimoPctMensual:    ultimos[0]?.pct_mensual ?? null,
+      actualizadoEn:       ultimos[0]?.actualizado_en || null,
+      mesActual:           mes,
+      alDia:               ultimos[0]?.mes === mes,
+      usosEsteMes:         usos,
+      cupoMensual:         ICL_CUPO_MENSUAL,
+      cupoAgotado:         usos >= ICL_CUPO_FRENO,
     });
   } catch (err) {
     console.error("[icl] Error en /estado:", err.message);
+    res.status(500).json({ error: "Error interno", detalle: err.message });
+  }
+});
+
+// GET /api/icl/meses?desde=2026-05&hasta=2026-07 — detalle mes a mes del cache
+// (lectura pública, alcanza con la anon key). El frontend arma el acumulado
+// compuesto por contrato localmente contra este detalle, igual que antes
+// hacía con ALQ_INDICES.ICL hardcodeado.
+app.get("/api/icl/meses", async (req, res) => {
+  try {
+    const { desde, hasta } = req.query;
+    if (!desde || !hasta) return res.status(400).json({ error: "Faltan parámetros desde/hasta (formato AAAA-MM)" });
+
+    const filtros = [`mes=gte.${desde}`, `mes=lte.${hasta}`, "select=mes,pct_mensual,valor_indice,estimado", "order=mes.asc"];
+    const rows = await sbQuery("alq_icl_mensual", filtros.join("&"));
+
+    res.json({ meses: rows.map(r => ({ mes: r.mes, pct_mensual: r.pct_mensual, valor_indice: r.valor_indice, estimado: !!r.estimado })) });
+  } catch (err) {
+    console.error("[icl] Error en /meses:", err.message);
     res.status(500).json({ error: "Error interno", detalle: err.message });
   }
 });
@@ -1022,6 +1042,7 @@ app.listen(PORT, () => {
   console.log(`   POST http://localhost:${PORT}/api/consumos/extraer-factura`);
   console.log(`   POST http://localhost:${PORT}/api/recordatorios`);
   console.log(`   GET  http://localhost:${PORT}/api/icl/estado`);
+  console.log(`   GET  http://localhost:${PORT}/api/icl/meses?desde=&hasta=`);
   console.log(`   POST http://localhost:${PORT}/api/icl/actualizar`);
   console.log(`   GET  http://localhost:${PORT}/api/health\n`);
   if (!process.env.ANTHROPIC_API_KEY)        console.warn("⚠️  ANTHROPIC_API_KEY no configurada — /api/chat no va a funcionar");
