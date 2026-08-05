@@ -877,9 +877,9 @@ cuadro de totales), y también los pagos/acreditaciones que figuran en el resume
   "items": [
     {
       "descripcion": <string, el nombre del comercio o concepto tal cual figura en el resumen>,
-      "monto": <número, el importe de esta línea en pesos argentinos — si el resumen ya lo muestra
-                en pesos usá ese valor directo; si el ítem está en dólares y hay una conversión clara
-                en la misma línea o en el resumen, usá el valor ya convertido a pesos>,
+      "monto": <número, el importe de esta línea EN LA MONEDA que indiques en "moneda" (ver regla
+                de moneda más abajo) — nunca conviertas dólares a pesos>,
+      "moneda": <"ars" o "usd" — ver regla de moneda más abajo>,
       "es_cuota": <true/false — true si la línea es una cuota de un plan (suele decir algo como
                    "3/12", "Cuota 3 de 12", "C.03/12", etc.)>,
       "cuota_actual": <número, la cuota actual del plan (ej: 3 en "3/12") — null si no es cuota>,
@@ -897,11 +897,26 @@ cuadro de totales), y también los pagos/acreditaciones que figuran en el resume
     {
       "descripcion": <string, tal cual figura en el resumen — ej: "Pago recibido", "Su pago",
                       "Pago resumen anterior", "Acreditación">,
-      "monto": <número, importe del pago/acreditación en pesos argentinos>,
+      "monto": <número, importe del pago/acreditación en la moneda indicada en "moneda">,
+      "moneda": <"ars" o "usd", misma lógica que en "items">,
       "fecha": <"YYYY-MM-DD", fecha del pago si figura — null si no figura>
     }
   ]
 }
+
+REGLA DE MONEDA (importante, se aplica a "items" y a "pagos"):
+Los resúmenes de tarjeta en Argentina suelen separar los consumos en dos bloques: uno en pesos
+(el principal, a veces sin aclarar moneda) y otro en dólares (compras en el exterior o hechas en
+USD, suele decir "Consumos en dólares", "U$S", "Dólares estadounidenses", etc.), a veces incluso
+en una página aparte del resumen.
+- Si la línea está en el bloque/columna de pesos: "moneda": "ars" y "monto" = el importe en pesos
+  tal cual figura.
+- Si la línea está en el bloque/columna de dólares: "moneda": "usd" y "monto" = el importe EN
+  DÓLARES tal cual figura ahí — NUNCA lo conviertas a pesos, aunque el resumen también muestre al
+  lado una columna con el equivalente en pesos ya convertido. Quedate siempre con el valor en
+  dólares original.
+- Si el resumen no separa nada por bloques y todo está expresado en pesos, "moneda" es "ars" para
+  todos los ítems.
 
 Reglas importantes para "items":
 - Incluí TODOS los ítems del detalle de consumos, uno por cada línea del resumen — no los agrupes
@@ -919,7 +934,8 @@ Reglas importantes para "items":
   cuota en distintas secciones del mismo documento (por ejemplo la cuota del período actual en el
   detalle de consumos y además un resumen de cuotas futuras), quedate solo con la cuota MÁS ACTUAL
   (el número de cuota más alto que corresponda al período que estás leyendo), no con las futuras
-  todavía no vencidas.
+  todavía no vencidas. Nunca devuelvas dos entradas en "items" con la misma descripción, el mismo
+  cuota_total y el mismo monto — eso es siempre la misma cuota leída dos veces.
 
 Reglas importantes para "pagos":
 - Incluí ahí las líneas que el resumen muestra como pago o acreditación ya recibida (lo que Ale
@@ -974,12 +990,17 @@ app.post("/api/consumos/extraer-items-tarjeta", uploadFactura.single("factura"),
     // (mismo plan, mismo comercio, mismo monto_total_compra), nos quedamos solo
     // con la ocurrencia de cuota_actual más alta (la más actual) — igual criterio
     // que ya usa el frontend al agrupar cuotas ya guardadas en Historial.
-    const itemsCrudos = Array.isArray(parsed?.items) ? parsed.items : [];
+    // "moneda" por defecto "ars" si la IA no la devuelve explícita (no debería
+    // pasar con el prompt actual, pero por las dudas no dejamos el campo vacío).
+    const itemsCrudos = (Array.isArray(parsed?.items) ? parsed.items : [])
+      .map(it => ({ ...it, moneda: it.moneda === "usd" ? "usd" : "ars" }));
     const noCuotas = itemsCrudos.filter(it => !it.es_cuota);
     const cuotas = itemsCrudos.filter(it => it.es_cuota);
     const cuotasPorPlan = {};
     for (const it of cuotas) {
-      const clave = [it.descripcion || "", it.monto_total_compra ?? "", it.cuota_total ?? ""].join("|");
+      // Clave robusta: descripción + moneda + cuota_total + monto por cuota
+      // (monto_total_compra suele venir null y no sirve para agrupar).
+      const clave = [it.descripcion || "", it.moneda, it.cuota_total ?? "", Number(it.monto ?? 0).toFixed(2)].join("|");
       const actual = cuotasPorPlan[clave];
       if (!actual || Number(it.cuota_actual ?? 0) > Number(actual.cuota_actual ?? 0)) {
         cuotasPorPlan[clave] = it;
@@ -987,7 +1008,8 @@ app.post("/api/consumos/extraer-items-tarjeta", uploadFactura.single("factura"),
     }
     const items = [...noCuotas, ...Object.values(cuotasPorPlan)];
 
-    const pagos = Array.isArray(parsed?.pagos) ? parsed.pagos : [];
+    const pagos = (Array.isArray(parsed?.pagos) ? parsed.pagos : [])
+      .map(p => ({ ...p, moneda: p.moneda === "usd" ? "usd" : "ars" }));
 
     res.json({ items, pagos });
 
