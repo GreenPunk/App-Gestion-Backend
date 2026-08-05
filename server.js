@@ -717,7 +717,9 @@ sin texto antes ni después, sin backticks, con esta forma exacta:
   "tasa_municipal": <número, tasa/alumbrado municipal si figura por separado>,
   "otros": <número, cualquier otro cargo que no encaje en los anteriores (mora, intereses, ajustes) — sumado>,
   "periodo_desde": <"YYYY-MM-DD", inicio del período facturado si figura>,
-  "periodo_hasta": <"YYYY-MM-DD", fin del período facturado si figura>
+  "periodo_hasta": <"YYYY-MM-DD", fin del período facturado si figura>,
+  "pago_registrado": <número, importe del último pago que la factura muestra como ya recibido/acreditado (a veces en un recuadro "Su pago" o "Pagos registrados con posterioridad a esta emisión") — null si no figura>,
+  "fecha_pago_registrado": <"YYYY-MM-DD", fecha de ese pago registrado — null si no figura>
 }
 
 IMPORTANTE — cargo variable con tarifa dividida en tramos: en la sección "Detalle de
@@ -753,7 +755,9 @@ antes ni después, sin backticks, con esta forma exacta:
   "tasa_municipal": <número, tasa municipal si figura por separado>,
   "otros": <número, cargos adicionales — mora, carta documento, intereses, ajustes — sumado>,
   "periodo_desde": <"YYYY-MM-DD", inicio del período facturado si figura>,
-  "periodo_hasta": <"YYYY-MM-DD", fin del período facturado si figura>
+  "periodo_hasta": <"YYYY-MM-DD", fin del período facturado si figura>,
+  "pago_registrado": <número, importe del último pago que la factura muestra como ya recibido/acreditado (a veces en un recuadro "Su pago" o "Pagos registrados con posterioridad a esta emisión") — null si no figura>,
+  "fecha_pago_registrado": <"YYYY-MM-DD", fecha de ese pago registrado — null si no figura>
 }
 
 IMPORTANTE: la cantidad de personas por unidad NO está en la factura — ese dato lo carga Ale a mano en el formulario, no lo completes vos.
@@ -772,7 +776,9 @@ backticks, con esta forma exacta:
   "total_dolares": <número, total en dólares si figura algún consumo/cuota en esa moneda>,
   "cotizacion_aplicada": <número, tipo de cambio usado para convertir el consumo en dólares a pesos, si figura>,
   "fecha_cierre": <"YYYY-MM-DD", fecha de cierre del resumen>,
-  "fecha_vencimiento": <"YYYY-MM-DD", fecha de vencimiento del pago>
+  "fecha_vencimiento": <"YYYY-MM-DD", fecha de vencimiento del pago>,
+  "pago_recibido": <número, importe del pago del resumen anterior que este resumen muestra como ya recibido/acreditado (línea tipo "Pago recibido", "Su pago", "Pago resumen anterior") — null si no figura>,
+  "fecha_pago_recibido": <"YYYY-MM-DD", fecha de ese pago recibido — null si no figura>
 }
 
 Si un campo no aparece en el resumen o no podés leerlo con confianza, poné null en ese campo — no inventes valores. No agregues campos extra.`,
@@ -792,7 +798,9 @@ backticks, con esta forma exacta:
   "total_dolares": <número, total en dólares si figura algún consumo/cuota en esa moneda>,
   "cotizacion_aplicada": <número, tipo de cambio usado para convertir el consumo en dólares a pesos, si figura>,
   "fecha_cierre": <"YYYY-MM-DD", fecha de cierre del resumen>,
-  "fecha_vencimiento": <"YYYY-MM-DD", fecha de vencimiento del pago>
+  "fecha_vencimiento": <"YYYY-MM-DD", fecha de vencimiento del pago>,
+  "pago_recibido": <número, importe del pago del resumen anterior que este resumen muestra como ya recibido/acreditado (línea tipo "Pago recibido", "Su pago", "Pago resumen anterior") — null si no figura>,
+  "fecha_pago_recibido": <"YYYY-MM-DD", fecha de ese pago recibido — null si no figura>
 }
 
 Si un campo no aparece en el resumen o no podés leerlo con confianza, poné null en ese campo — no inventes valores. No agregues campos extra.`,
@@ -851,7 +859,9 @@ app.post("/api/consumos/extraer-factura", uploadFactura.single("factura"), async
 // A diferencia de /api/consumos/extraer-factura (que lee los TOTALES de un
 // único resumen), este endpoint lee el detalle completo de consumos de un
 // resumen de tarjeta (Visa o Mastercard) y devuelve un ítem por cada línea
-// de compra — incluyendo cuotas, con su categoría asignada por la IA. El
+// de compra — incluyendo cuotas, con su categoría asignada por la IA — más
+// un detalle aparte de los pagos/acreditaciones que figuran en el resumen
+// (para poder ver cuánto se pagó realmente, no solo cuánto se consumió). El
 // frontend (`ModuloConsumosServicios.jsx` → `PantallaCargaMasivaTarjetas`)
 // inserta cada ítem devuelto directamente en `serv_tarjeta_items`, igual
 // que si Ale los hubiera tipeado a mano uno por uno.
@@ -860,8 +870,8 @@ function promptExtraccionItemsTarjeta(tarjetaLabel) {
   return `Sos un extractor de datos de resúmenes de tarjeta de crédito ${tarjetaLabel} (Argentina).
 Te paso la imagen o PDF del resumen completo (puede tener varias páginas). Tu tarea es leer TODOS
 los ítems/consumos individuales que aparecen listados en el detalle de compras del resumen (no el
-cuadro de totales), y devolver ÚNICAMENTE un objeto JSON, sin texto antes ni después, sin backticks,
-con esta forma exacta:
+cuadro de totales), y también los pagos/acreditaciones que figuran en el resumen. Devolvé
+ÚNICAMENTE un objeto JSON, sin texto antes ni después, sin backticks, con esta forma exacta:
 
 {
   "items": [
@@ -882,18 +892,40 @@ con esta forma exacta:
                     "Indumentaria", "Salud", "Servicios", "Entretenimiento", "Tecnología", "Hogar",
                     "Transporte", "Educación", "Otros". Elegí la que mejor describa cada ítem>
     }
+  ],
+  "pagos": [
+    {
+      "descripcion": <string, tal cual figura en el resumen — ej: "Pago recibido", "Su pago",
+                      "Pago resumen anterior", "Acreditación">,
+      "monto": <número, importe del pago/acreditación en pesos argentinos>,
+      "fecha": <"YYYY-MM-DD", fecha del pago si figura — null si no figura>
+    }
   ]
 }
 
-Reglas importantes:
+Reglas importantes para "items":
 - Incluí TODOS los ítems del detalle de consumos, uno por cada línea del resumen — no los agrupes
   ni resumas en uno solo.
-- NO incluyas líneas de totales, subtotales, saldo anterior, pagos/acreditaciones recibidas,
-  intereses financieros del resumen en sí, ni el IVA/impuestos generales del resumen — eso no es
-  un ítem de consumo.
+- NO incluyas líneas de totales, subtotales, saldo anterior, pagos/acreditaciones recibidas
+  (esas van en "pagos", ver abajo), intereses financieros del resumen en sí, ni el IVA/impuestos
+  generales del resumen — eso no es un ítem de consumo.
 - Si un ítem no tiene un monto legible con confianza, no lo incluyas en la lista en vez de inventar
   un valor.
-- No agregues campos extra a cada ítem ni texto fuera del JSON.`;
+- No agregues campos extra a cada ítem ni texto fuera del JSON.
+- ANTIDUPLICADO — muy importante: si el mismo consumo aparece más de una vez en el documento (por
+  ejemplo porque el resumen repite el detalle de consumos del período y además trae un cuadro
+  aparte de "Próximas cuotas" o "Cuotas a vencer" con las mismas compras), incluilo UNA SOLA VEZ en
+  "items" — nunca dupliques la misma línea. Si una compra en cuotas aparece con distintos números de
+  cuota en distintas secciones del mismo documento (por ejemplo la cuota del período actual en el
+  detalle de consumos y además un resumen de cuotas futuras), quedate solo con la cuota MÁS ACTUAL
+  (el número de cuota más alto que corresponda al período que estás leyendo), no con las futuras
+  todavía no vencidas.
+
+Reglas importantes para "pagos":
+- Incluí ahí las líneas que el resumen muestra como pago o acreditación ya recibida (lo que Ale
+  efectivamente pagó del resumen anterior), que NO se deben incluir en "items".
+- Si no hay ninguna línea de pago/acreditación visible en el resumen, devolvé "pagos": [] (lista vacía,
+  no lo omitas ni inventes un pago).`;
 }
 
 app.post("/api/consumos/extraer-items-tarjeta", uploadFactura.single("factura"), async (req, res) => {
@@ -913,7 +945,8 @@ app.post("/api/consumos/extraer-items-tarjeta", uploadFactura.single("factura"),
       : { type: "image", source: { type: "base64", media_type: req.file.mimetype, data: base64 } };
 
     // max_tokens más alto que en /extraer-factura: un resumen completo puede
-    // traer varias decenas de ítems, y cada uno ocupa varias líneas de JSON.
+    // traer varias decenas de ítems (más los pagos), y cada uno ocupa varias
+    // líneas de JSON.
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-5",
       max_tokens: 4000,
@@ -936,8 +969,27 @@ app.post("/api/consumos/extraer-items-tarjeta", uploadFactura.single("factura"),
       return res.status(422).json({ error: "La IA no devolvió un JSON válido", respuesta_cruda: textoResp });
     }
 
-    const items = Array.isArray(parsed?.items) ? parsed.items : [];
-    res.json({ items });
+    // Deduplicado defensivo del lado del servidor: si a pesar de la instrucción
+    // antiduplicado del prompt la IA devuelve la misma cuota más de una vez
+    // (mismo plan, mismo comercio, mismo monto_total_compra), nos quedamos solo
+    // con la ocurrencia de cuota_actual más alta (la más actual) — igual criterio
+    // que ya usa el frontend al agrupar cuotas ya guardadas en Historial.
+    const itemsCrudos = Array.isArray(parsed?.items) ? parsed.items : [];
+    const noCuotas = itemsCrudos.filter(it => !it.es_cuota);
+    const cuotas = itemsCrudos.filter(it => it.es_cuota);
+    const cuotasPorPlan = {};
+    for (const it of cuotas) {
+      const clave = [it.descripcion || "", it.monto_total_compra ?? "", it.cuota_total ?? ""].join("|");
+      const actual = cuotasPorPlan[clave];
+      if (!actual || Number(it.cuota_actual ?? 0) > Number(actual.cuota_actual ?? 0)) {
+        cuotasPorPlan[clave] = it;
+      }
+    }
+    const items = [...noCuotas, ...Object.values(cuotasPorPlan)];
+
+    const pagos = Array.isArray(parsed?.pagos) ? parsed.pagos : [];
+
+    res.json({ items, pagos });
 
   } catch (err) {
     console.error("[extraer-items-tarjeta] Error:", err.message);
@@ -1151,13 +1203,13 @@ setInterval(procesarRecordatoriosPendientes, 5 * 60 * 1000);
 setTimeout(procesarRecordatoriosPendientes, 30 * 1000);
 
 // ── Health ────────────────────────────────────────────────────
-const healthRes = () => ({ status: "ok", version: "2.7.0", ts: new Date().toISOString() });
+const healthRes = () => ({ status: "ok", version: "2.8.0", ts: new Date().toISOString() });
 app.get("/",           (req, res) => res.json(healthRes()));
 app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.7.0 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.8.0 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
   console.log(`   POST http://localhost:${PORT}/api/consumos/extraer-factura`);
