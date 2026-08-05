@@ -7,7 +7,8 @@
  *  ENDPOINTS:
  *    POST /api/generar-docx             → recibe plantilla + datos, devuelve .docx relleno
  *    POST /api/chat                     → chat IA con contexto del tenant (streaming SSE)
- *    POST /api/consumos/extraer-factura → extrae datos de una factura (Edenor/Naturgy/Visa) con IA
+ *    POST /api/consumos/extraer-factura → extrae datos de una factura (Edenor/Naturgy/Visa/Mastercard) con IA
+ *    POST /api/consumos/extraer-items-tarjeta → lee todos los ítems de un resumen de tarjeta (Visa/Mastercard) con IA
  *    POST /api/recordatorios            → crea un recordatorio (email + WhatsApp)
  *    GET  /api/icl/estado               → estado del cache de ICL (último mes, cupo de API usado)
  *    POST /api/icl/actualizar           → trae meses faltantes de ICL desde ARquilerAPI y los cachea
@@ -692,12 +693,13 @@ app.post("/api/generar-docx", upload.single("plantilla"), (req, res) => {
 
 // ── ENDPOINT /api/consumos/extraer-factura ─────────────────────
 // Módulo "Consumos de Servicios" (personal, Alex). Recibe la foto/PDF de una
-// factura + la fuente (edenor/naturgy/visa), le pide a la IA que devuelva
-// SOLO un JSON con los campos de esa factura (ver prompts abajo — mismo
-// texto que `prompts_extraccion_facturas.md`), y se lo devuelve al frontend
-// ya parseado para precargar el formulario de confirmación. No guarda nada
-// en Supabase acá — el insert en `serv_facturas` lo hace el frontend recién
-// cuando Ale confirma, después de revisar/corregir los valores.
+// factura + la fuente (edenor/naturgy/visa/mastercard), le pide a la IA que
+// devuelva SOLO un JSON con los campos de esa factura (ver prompts abajo —
+// mismo texto que `prompts_extraccion_facturas.md`), y se lo devuelve al
+// frontend ya parseado para precargar el formulario de confirmación. No
+// guarda nada en Supabase acá — el insert en `serv_facturas` lo hace el
+// frontend recién cuando Ale confirma, después de revisar/corregir los
+// valores.
 const PROMPTS_EXTRACCION_FACTURA = {
   edenor: `Sos un extractor de datos de facturas de electricidad de Edenor (Argentina).
 Te paso la imagen o PDF de una factura. Devolvé ÚNICAMENTE un objeto JSON,
@@ -774,6 +776,26 @@ backticks, con esta forma exacta:
 }
 
 Si un campo no aparece en el resumen o no podés leerlo con confianza, poné null en ese campo — no inventes valores. No agregues campos extra.`,
+
+  // Mismo formato que "visa" — reutiliza el prompt de Visa cambiando la
+  // referencia de marca, tal como quedó decidido en el plan del módulo
+  // (Consumos de Servicios, "Tarjetas — Mastercard sumada como fuente").
+  mastercard: `Sos un extractor de datos de resúmenes de tarjeta Mastercard (Argentina), para
+seguir el pago del alquiler/gastos en dólares. Te paso la imagen o PDF del
+resumen. Devolvé ÚNICAMENTE un objeto JSON, sin texto antes ni después, sin
+backticks, con esta forma exacta:
+
+{
+  "anio": <número, año del cierre>,
+  "mes": <número 1-12, mes del cierre>,
+  "total_pesos": <número, total del resumen en pesos argentinos>,
+  "total_dolares": <número, total en dólares si figura algún consumo/cuota en esa moneda>,
+  "cotizacion_aplicada": <número, tipo de cambio usado para convertir el consumo en dólares a pesos, si figura>,
+  "fecha_cierre": <"YYYY-MM-DD", fecha de cierre del resumen>,
+  "fecha_vencimiento": <"YYYY-MM-DD", fecha de vencimiento del pago>
+}
+
+Si un campo no aparece en el resumen o no podés leerlo con confianza, poné null en ese campo — no inventes valores. No agregues campos extra.`,
 };
 
 app.post("/api/consumos/extraer-factura", uploadFactura.single("factura"), async (req, res) => {
@@ -784,7 +806,7 @@ app.post("/api/consumos/extraer-factura", uploadFactura.single("factura"), async
     }
     const prompt = PROMPTS_EXTRACCION_FACTURA[fuente];
     if (!prompt) {
-      return res.status(400).json({ error: `Fuente desconocida: '${fuente}'. Usar "edenor", "naturgy" o "visa".` });
+      return res.status(400).json({ error: `Fuente desconocida: '${fuente}'. Usar "edenor", "naturgy", "visa" o "mastercard".` });
     }
 
     const esPdf = req.file.mimetype === "application/pdf";
@@ -821,6 +843,105 @@ app.post("/api/consumos/extraer-factura", uploadFactura.single("factura"), async
   } catch (err) {
     console.error("[extraer-factura] Error:", err.message);
     res.status(500).json({ error: "Error al extraer datos de la factura", detalle: err.message });
+  }
+});
+
+// ── ENDPOINT /api/consumos/extraer-items-tarjeta ────────────────
+// Módulo "Consumos de Servicios" → pantalla "Tarjetas" → carga masiva.
+// A diferencia de /api/consumos/extraer-factura (que lee los TOTALES de un
+// único resumen), este endpoint lee el detalle completo de consumos de un
+// resumen de tarjeta (Visa o Mastercard) y devuelve un ítem por cada línea
+// de compra — incluyendo cuotas, con su categoría asignada por la IA. El
+// frontend (`ModuloConsumosServicios.jsx` → `PantallaCargaMasivaTarjetas`)
+// inserta cada ítem devuelto directamente en `serv_tarjeta_items`, igual
+// que si Ale los hubiera tipeado a mano uno por uno.
+// No guarda nada en Supabase acá — el insert lo hace el frontend.
+function promptExtraccionItemsTarjeta(tarjetaLabel) {
+  return `Sos un extractor de datos de resúmenes de tarjeta de crédito ${tarjetaLabel} (Argentina).
+Te paso la imagen o PDF del resumen completo (puede tener varias páginas). Tu tarea es leer TODOS
+los ítems/consumos individuales que aparecen listados en el detalle de compras del resumen (no el
+cuadro de totales), y devolver ÚNICAMENTE un objeto JSON, sin texto antes ni después, sin backticks,
+con esta forma exacta:
+
+{
+  "items": [
+    {
+      "descripcion": <string, el nombre del comercio o concepto tal cual figura en el resumen>,
+      "monto": <número, el importe de esta línea en pesos argentinos — si el resumen ya lo muestra
+                en pesos usá ese valor directo; si el ítem está en dólares y hay una conversión clara
+                en la misma línea o en el resumen, usá el valor ya convertido a pesos>,
+      "es_cuota": <true/false — true si la línea es una cuota de un plan (suele decir algo como
+                   "3/12", "Cuota 3 de 12", "C.03/12", etc.)>,
+      "cuota_actual": <número, la cuota actual del plan (ej: 3 en "3/12") — null si no es cuota>,
+      "cuota_total": <número, el total de cuotas del plan (ej: 12 en "3/12") — null si no es cuota>,
+      "monto_total_compra": <número, el monto total de la compra original si figura explícito, o
+                              cuota x cantidad de cuotas si se puede inferir con confianza — null si
+                              no figura o no es cuota>,
+      "categoria": <string corta en español, una sola categoría general del gasto, elegida según el
+                    comercio/concepto — por ejemplo: "Supermercado", "Combustible", "Gastronomía",
+                    "Indumentaria", "Salud", "Servicios", "Entretenimiento", "Tecnología", "Hogar",
+                    "Transporte", "Educación", "Otros". Elegí la que mejor describa cada ítem>
+    }
+  ]
+}
+
+Reglas importantes:
+- Incluí TODOS los ítems del detalle de consumos, uno por cada línea del resumen — no los agrupes
+  ni resumas en uno solo.
+- NO incluyas líneas de totales, subtotales, saldo anterior, pagos/acreditaciones recibidas,
+  intereses financieros del resumen en sí, ni el IVA/impuestos generales del resumen — eso no es
+  un ítem de consumo.
+- Si un ítem no tiene un monto legible con confianza, no lo incluyas en la lista en vez de inventar
+  un valor.
+- No agregues campos extra a cada ítem ni texto fuera del JSON.`;
+}
+
+app.post("/api/consumos/extraer-items-tarjeta", uploadFactura.single("factura"), async (req, res) => {
+  try {
+    const { tarjeta } = req.body;
+    if (!req.file) {
+      return res.status(400).json({ error: "No se recibió el archivo (campo: factura)" });
+    }
+    const tarjetaLabel = tarjeta === "mastercard" ? "Mastercard" : "Visa";
+    const prompt = promptExtraccionItemsTarjeta(tarjetaLabel);
+
+    const esPdf = req.file.mimetype === "application/pdf";
+    const base64 = req.file.buffer.toString("base64");
+
+    const bloqueArchivo = esPdf
+      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } }
+      : { type: "image", source: { type: "base64", media_type: req.file.mimetype, data: base64 } };
+
+    // max_tokens más alto que en /extraer-factura: un resumen completo puede
+    // traer varias decenas de ítems, y cada uno ocupa varias líneas de JSON.
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-5",
+      max_tokens: 4000,
+      messages: [
+        { role: "user", content: [bloqueArchivo, { type: "text", text: prompt }] },
+      ],
+    });
+
+    const textoResp = response.content
+      .filter(b => b.type === "text")
+      .map(b => b.text)
+      .join("\n")
+      .trim();
+    const limpio = textoResp.replace(/```json|```/g, "").trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(limpio);
+    } catch {
+      return res.status(422).json({ error: "La IA no devolvió un JSON válido", respuesta_cruda: textoResp });
+    }
+
+    const items = Array.isArray(parsed?.items) ? parsed.items : [];
+    res.json({ items });
+
+  } catch (err) {
+    console.error("[extraer-items-tarjeta] Error:", err.message);
+    res.status(500).json({ error: "Error al extraer los ítems del resumen", detalle: err.message });
   }
 });
 
@@ -1030,16 +1151,17 @@ setInterval(procesarRecordatoriosPendientes, 5 * 60 * 1000);
 setTimeout(procesarRecordatoriosPendientes, 30 * 1000);
 
 // ── Health ────────────────────────────────────────────────────
-const healthRes = () => ({ status: "ok", version: "2.5.5", ts: new Date().toISOString() });
+const healthRes = () => ({ status: "ok", version: "2.7.0", ts: new Date().toISOString() });
 app.get("/",           (req, res) => res.json(healthRes()));
 app.get("/health",     (req, res) => res.json(healthRes()));
 app.get("/api/health", (req, res) => res.json(healthRes()));
 
 app.listen(PORT, () => {
-  console.log(`\n✅ Backend SaaS Inmobiliaria v2.6.0 corriendo en http://localhost:${PORT}`);
+  console.log(`\n✅ Backend SaaS Inmobiliaria v2.7.0 corriendo en http://localhost:${PORT}`);
   console.log(`   POST http://localhost:${PORT}/api/generar-docx`);
   console.log(`   POST http://localhost:${PORT}/api/chat`);
   console.log(`   POST http://localhost:${PORT}/api/consumos/extraer-factura`);
+  console.log(`   POST http://localhost:${PORT}/api/consumos/extraer-items-tarjeta`);
   console.log(`   POST http://localhost:${PORT}/api/recordatorios`);
   console.log(`   GET  http://localhost:${PORT}/api/icl/estado`);
   console.log(`   GET  http://localhost:${PORT}/api/icl/meses?desde=&hasta=`);
