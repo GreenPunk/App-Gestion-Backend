@@ -12,6 +12,9 @@
  *    POST /api/recordatorios            → crea un recordatorio (email + WhatsApp)
  *    GET  /api/icl/estado               → estado del cache de ICL (último mes, cupo de API usado)
  *    POST /api/icl/actualizar           → trae meses faltantes de ICL desde ARquilerAPI y los cachea
+ *    GET  /api/whatsapp/webhook         → verificación del webhook de Meta (WhatsApp Cloud API)
+ *    POST /api/whatsapp/webhook         → recibe mensajes entrantes y estados de Meta
+ *    POST /api/whatsapp/send            → manda un mensaje de WhatsApp (usado por el módulo de leads)
  *    GET  /api/health                   → estado del servidor
  * ─────────────────────────────────────────────────────────────
  */
@@ -25,6 +28,7 @@ const path          = require("path");
 const fs            = require("fs");
 const Anthropic     = require("@anthropic-ai/sdk");
 const crearModuloLeads = require("./emp-leads.js");
+const crearModuloWhatsapp = require("./emp-whatsapp.js");
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
@@ -122,6 +126,12 @@ async function sbUpsertService(table, rows, conflictColumn) {
 const { router: leadsRouter, iniciarPolling } = crearModuloLeads({ SB_URL, SB_KEY, sbQuery });
 app.use("/api", leadsRouter);
 iniciarPolling(3); // cada 3 minutos
+
+// ── Módulo WhatsApp Cloud API (envío + webhook de mensajes) ──
+// Mismo patrón que el módulo de leads: factory que recibe las credenciales
+// de Supabase ya armadas acá arriba y devuelve un router para montar.
+const { router: whatsappRouter } = crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery });
+app.use("/api/whatsapp", whatsappRouter);
 
 // ── Índice ICL — ARquilerAPI (RapidAPI) ──────────────────────
 //
@@ -1240,10 +1250,16 @@ app.listen(PORT, () => {
   console.log(`   GET  http://localhost:${PORT}/api/icl/estado`);
   console.log(`   GET  http://localhost:${PORT}/api/icl/meses?desde=&hasta=`);
   console.log(`   POST http://localhost:${PORT}/api/icl/actualizar`);
+  console.log(`   GET  http://localhost:${PORT}/api/whatsapp/webhook (verificación de Meta)`);
+  console.log(`   POST http://localhost:${PORT}/api/whatsapp/webhook (mensajes entrantes)`);
+  console.log(`   POST http://localhost:${PORT}/api/whatsapp/send`);
   console.log(`   GET  http://localhost:${PORT}/api/health\n`);
   if (!process.env.ANTHROPIC_API_KEY)        console.warn("⚠️  ANTHROPIC_API_KEY no configurada — /api/chat no va a funcionar");
   if (!process.env.SUPABASE_URL)             console.warn("⚠️  SUPABASE_URL no configurada — contexto del agente estará vacío");
   if (!process.env.RESEND_API_KEY)           console.warn("⚠️  RESEND_API_KEY no configurada — cron enviará emails en modo silencioso");
   if (!process.env.SUPABASE_SERVICE_ROLE_KEY) console.warn("⚠️  SUPABASE_SERVICE_ROLE_KEY no configurada — /api/icl/actualizar no va a poder escribir en Supabase");
   if (!process.env.RAPIDAPI_ICL_KEY)          console.warn("⚠️  RAPIDAPI_ICL_KEY no configurada — /api/icl/actualizar no va a funcionar");
+  if (!process.env.WHATSAPP_TOKEN)            console.warn("⚠️  WHATSAPP_TOKEN no configurada — /api/whatsapp/send no va a funcionar");
+  if (!process.env.WHATSAPP_PHONE_NUMBER_ID)  console.warn("⚠️  WHATSAPP_PHONE_NUMBER_ID no configurada — /api/whatsapp/send no va a funcionar");
+  if (!process.env.WHATSAPP_VERIFY_TOKEN)     console.warn("⚠️  WHATSAPP_VERIFY_TOKEN no configurada — la verificación del webhook de Meta va a fallar");
 });
