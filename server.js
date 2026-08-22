@@ -1259,7 +1259,7 @@ app.listen(PORT, () => {
   if (!process.env.RESEND_API_KEY)           console.warn("⚠️  RESEND_API_KEY no configurada — cron enviará emails en modo silencioso");
   if (!process.env.SUPABASE_SERVICE_ROLE_KEY) console.warn("⚠️  SUPABASE_SERVICE_ROLE_KEY no configurada — /api/icl/actualizar no va a poder escribir en Supabase");
   if (!process.env.RAPIDAPI_ICL_KEY)          console.warn("⚠️  RAPIDAPI_ICL_KEY no configurada — /api/icl/actualizar no va a funcionar");
-  if (!process.env.WHATSAPP_TOKEN)            console.warn("⚠️  WHATSAPP_TOKEN no configurada — /api/whatsapp/send no va a funcionar");
-  if (!process.env.WHATSAPP_PHONE_NUMBER_ID)  console.warn("⚠️  WHATSAPP_PHONE_NUMBER_ID no configurada — /api/whatsapp/send no va a funcionar");
+  if (!process.env.WHATSAPP_TOKEN)            console.warn("⚠️  WHATSAPP_TOKEN no configurada — /api/whatsapp/send va a funcionar en MODO PRUEBA (simula el envío, no llama a Meta)");
+  if (!process.env.WHATSAPP_PHONE_NUMBER_ID)  console.warn("⚠️  WHATSAPP_PHONE_NUMBER_ID no configurada — /api/whatsapp/send va a funcionar en MODO PRUEBA (simula el envío, no llama a Meta)");
   if (!process.env.WHATSAPP_VERIFY_TOKEN)     console.warn("⚠️  WHATSAPP_VERIFY_TOKEN no configurada — la verificación del webhook de Meta va a fallar");
 });

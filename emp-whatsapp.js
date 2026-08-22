@@ -56,7 +56,29 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
     return val;
   }
 
+  // ── Modo prueba (sin credenciales de Meta todavía) ───────────
+  // Mientras no estén cargadas WHATSAPP_TOKEN / WHATSAPP_PHONE_NUMBER_ID en
+  // Render, no tiene sentido intentar pegarle a la Graph API (va a fallar
+  // siempre). En vez de devolver error, se simula el envío: se genera un
+  // id falso y se guarda todo en Supabase igual que si hubiera salido, así
+  // se puede probar el resto de la interfaz (bitácora, badges, inbox) sin
+  // depender de tener el token real todavía. El día que se carguen esas
+  // variables en Render, esto deja de activarse solo — no hace falta tocar
+  // nada más acá.
+  function credencialesMetaConfiguradas() {
+    return !!(process.env.WHATSAPP_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID);
+  }
+
   async function sendTextMessage(to, body) {
+    if (!credencialesMetaConfiguradas()) {
+      console.warn("[whatsapp] Modo prueba: WHATSAPP_TOKEN/WHATSAPP_PHONE_NUMBER_ID no configurados todavía — se simula el envío, no se llama a Meta.");
+      return {
+        messaging_product: "whatsapp",
+        messages: [{ id: `SIMULADO-${Date.now()}` }],
+        __simulado: true,
+      };
+    }
+
     const token = requireEnv("WHATSAPP_TOKEN");
     const phoneNumberId = requireEnv("WHATSAPP_PHONE_NUMBER_ID");
 
@@ -180,14 +202,28 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
 
   // ── POST /api/whatsapp/send — usado por el módulo de leads ───
   router.post("/send", async (req, res) => {
-    const { tenantId, telefono, mensaje, leadId, agenteId } = req.body;
+    const { tenantId, telefono, mensaje, leadId, agenteId } = req.body || {};
+
     if (!tenantId || !telefono || !mensaje) {
-      return res.status(400).json({ error: "Faltan tenantId, telefono o mensaje" });
+      // Detalle de qué campo falta puntualmente — el mensaje genérico
+      // anterior no alcanzaba para diagnosticar desde el frontend. Se loguea
+      // el body completo (sin datos sensibles: son datos del propio lead)
+      // para poder revisar en los logs de Render si vuelve a pasar.
+      const faltantes = [];
+      if (!tenantId) faltantes.push("tenantId");
+      if (!telefono) faltantes.push("telefono");
+      if (!mensaje) faltantes.push("mensaje");
+      console.warn("[whatsapp] /send rechazado, faltan campos:", faltantes.join(", "), "— body recibido:", JSON.stringify(req.body));
+      return res.status(400).json({
+        error: `Faltan datos para enviar: ${faltantes.join(", ")}`,
+        faltantes,
+      });
     }
 
     try {
       const result = await sendTextMessage(telefono, mensaje);
       const waMessageId = result?.messages?.[0]?.id || null;
+      const simulado = !!result?.__simulado;
 
       const conv = await getOrCreateConversacion(tenantId, telefono, null);
       if (leadId && !conv.lead_id) {
@@ -199,13 +235,15 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
         direccion: "saliente",
         cuerpo: mensaje,
         wa_message_id: waMessageId,
-        estado: "enviado",
+        estado: simulado ? "simulado" : "enviado",
         agente_id: agenteId || null,
       });
-      await actualizarUltimoMensaje(conv.id, mensaje, "saliente", false);
+      await actualizarUltimoMensaje(conv.id, simulado ? `[PRUEBA] ${mensaje}` : mensaje, "saliente", false);
 
-      console.log(`[whatsapp] Mensaje enviado a ${telefono} (tenant ${tenantId})`);
-      res.json({ ok: true, waMessageId });
+      console.log(simulado
+        ? `[whatsapp] Mensaje SIMULADO (falta configurar Meta) a ${telefono} (tenant ${tenantId})`
+        : `[whatsapp] Mensaje enviado a ${telefono} (tenant ${tenantId})`);
+      res.json({ ok: true, waMessageId, simulado });
     } catch (e) {
       console.error("[whatsapp] Error en /send:", e.message);
       res.status(500).json({ ok: false, error: e.message });
