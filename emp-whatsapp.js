@@ -103,6 +103,34 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
     return data;
   }
 
+  // ── Matching de lead por teléfono ────────────────────────────
+  // WA-BUG-03: el teléfono del lead en emp_leads suele estar cargado con
+  // formato humano ("011 3430-3463"), pero el que manda Meta es solo
+  // dígitos ("5491134303463"). Comparar el string crudo contra los dígitos
+  // (como se hacía antes) casi nunca matcheaba por el espacio/guion en el
+  // medio. Acá se resuelve en 2 pasos: 1) un filtro barato en la base por
+  // los últimos 4 dígitos (en el formato argentino XXXX-XXXX esos 4 quedan
+  // siempre juntos, sin guion en el medio, así que el ilike no falla ahí),
+  // 2) comparación exacta en memoria normalizando (solo dígitos) los
+  // candidatos que trajo ese filtro. Si el filtro trae más de un lead con
+  // el mismo teléfono normalizado, no se linkea automático — es preferible
+  // dejarlo sin asignar que asignarlo al lead equivocado.
+  function soloDigitos(s) {
+    return (s || "").replace(/\D/g, "");
+  }
+
+  async function buscarLeadPorTelefono(tenantId, telefonoWa) {
+    const ultimos10 = soloDigitos(telefonoWa).slice(-10);
+    const ultimos4 = ultimos10.slice(-4);
+    if (!ultimos4) return null;
+    const candidatos = await sbQuery(
+      "emp_leads",
+      `tenant_id=eq.${tenantId}&telefono=ilike.*${ultimos4}&select=id,telefono&limit=50`
+    ).catch(() => []);
+    const matches = candidatos.filter(l => soloDigitos(l.telefono).slice(-10) === ultimos10);
+    return matches.length === 1 ? matches[0].id : null;
+  }
+
   // ── Helpers de conversación ──────────────────────────────────
   async function getOrCreateConversacion(tenantId, telefono, nombreContacto) {
     const existentes = await sbQuery(
@@ -111,17 +139,13 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
     );
     if (existentes[0]) return existentes[0];
 
-    const ultimos10 = telefono.slice(-10);
-    const leadsMatch = await sbQuery(
-      "emp_leads",
-      `tenant_id=eq.${tenantId}&telefono=ilike.*${ultimos10}&select=id&limit=1`
-    ).catch(() => []);
+    const leadId = await buscarLeadPorTelefono(tenantId, telefono);
 
     const nueva = await sbWrite("emp_whatsapp_conversaciones", "POST", {
       tenant_id: tenantId,
       telefono,
       nombre_contacto: nombreContacto || null,
-      lead_id: leadsMatch[0]?.id || null,
+      lead_id: leadId,
     });
     return nueva[0];
   }
