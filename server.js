@@ -254,20 +254,34 @@ app.post("/api/icl/actualizar", async (req, res) => {
     }
 
     // El primer punto es la base (dif:0, es la fecha de arranque, no un mes real).
-    // Cada punto siguiente, con months:1, tiene su dif = variación de ese mes puntual.
+    // Cada punto siguiente tiene su dif = variación de UN mes puntual — pero
+    // OJO: `p.date` que devuelve ARquilerAPI es la fecha de LLEGADA del
+    // cálculo compuesto (desde + N meses), no el mes al que corresponde esa
+    // variación. Ej: pedís date=2026-08-01, months=1 → te devuelve el punto
+    // con date=2026-09-01 y dif=variación de AGOSTO (el mes que va de
+    // 08-01 a 09-01). Si usás p.date para el mes, agosto queda guardado
+    // como si fuera septiembre (bug detectado 23/08/2026 — ver fila mal
+    // cacheada, corregida a mano en Supabase).
+    // Por eso el mes de cada punto se calcula nosotros mismos, contando
+    // meses hacia adelante desde `desde` (que es el mes que efectivamente
+    // pedimos), en vez de confiar en `p.date`.
     const puntos = body.data.slice(1);
     if (puntos.length === 0) {
       console.log("[icl] La API no devolvió meses nuevos todavía");
       return res.json({ ok: true, sinCambios: true, ultimoMesCacheado: ultimoMes });
     }
 
-    const filas = puntos.map(p => ({
-      mes:            p.date.slice(0, 7),
-      pct_mensual:    p.dif,
-      valor_indice:   p.value,
-      estimado:       !!p.estimated,
-      actualizado_en: new Date().toISOString(),
-    }));
+    const [desdeY, desdeM] = desde.slice(0, 7).split("-").map(Number); // desdeM 1-indexado
+    const filas = puntos.map((p, i) => {
+      const mesPunto = new Date(Date.UTC(desdeY, (desdeM - 1) + i, 1)).toISOString().slice(0, 7);
+      return {
+        mes:            mesPunto,
+        pct_mensual:    p.dif,
+        valor_indice:   p.value,
+        estimado:       !!p.estimated,
+        actualizado_en: new Date().toISOString(),
+      };
+    });
 
     await sbUpsertService("alq_icl_mensual", filas, "mes");
     console.log(`[icl] Cacheados ${filas.length} mes(es): ${filas.map(f => f.mes).join(", ")}`);
