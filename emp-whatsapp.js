@@ -17,10 +17,17 @@
  * Tablas en Supabase (confirmado 2026-08-22 vía Supabase MCP — el esquema ya
  * tiene TODO lo necesario para plantillas y envío masivo, así que este
  * archivo escribe directo sobre esas columnas, sin migración pendiente):
- *   emp_whatsapp_conversaciones (+ ultimo_entrante_fecha, para la ventana de 24hs)
+ *   emp_whatsapp_conversaciones (+ ultimo_entrante_fecha, para la ventana de 24hs;
+ *                                  + oculto, agregada 2026-08-23 para WA-MEJ-10 —
+ *                                  soft-delete de un chat del inbox, se resetea
+ *                                  a false solo si el contacto vuelve a escribir)
  *   emp_whatsapp_mensajes (+ tipo: texto|template|media, template_name,
- *                            media_url/media_id/media_tipo/media_nombre)
- *   emp_whatsapp_envios_masivos (para WA-MEJ-03, todavía sin usar acá)
+ *                            media_url/media_id/media_tipo/media_nombre;
+ *                            + oculto, agregada 2026-08-23 para WA-MEJ-13 —
+ *                            "ocultar de mi vista" un mensaje puntual, no
+ *                            borra nada del lado de WhatsApp/Meta)
+ *   emp_whatsapp_envios_masivos (usada desde 2026-08-23 por
+ *                                 POST /send-template-masivo, WA-MEJ-11/12)
  *   tenants.whatsapp_phone_number_id  (columna nueva, para resolver el tenant
  *                                       desde el webhook de Meta)
  * ─────────────────────────────────────────────────────────────
@@ -383,7 +390,13 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
     // nada). Por eso se guarda aparte y solo se pisa cuando el mensaje que
     // llega es "entrante" — si el agente responde después, esta fecha no
     // se toca, así la ventana sigue contando desde que escribió el cliente.
-    if (direccion === "entrante") patch.ultimo_entrante_fecha = ahora;
+    // WA-MEJ-10: si el chat estaba oculto (el agente lo "eliminó" de la
+    // lista) y el contacto vuelve a escribir, tiene que reaparecer en el
+    // inbox — un mensaje nuevo no puede quedar escondido.
+    if (direccion === "entrante") {
+      patch.ultimo_entrante_fecha = ahora;
+      patch.oculto = false;
+    }
     return sbWrite("emp_whatsapp_conversaciones", "PATCH", patch, `?id=eq.${conversacionId}`);
   }
 
@@ -583,6 +596,108 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
       res.json({ ok: true, waMessageId, simulado });
     } catch (e) {
       console.error("[whatsapp] Error en /send-template:", e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // ── POST /api/whatsapp/send-template-masivo — WA-MEJ-11 / WA-MEJ-12 ──
+  // Manda la misma plantilla aprobada a varios destinatarios a la vez.
+  // Usado tanto desde la multi-selección de chats en WhatsAppPanel
+  // (WA-MEJ-11) como desde la selección múltiple de Leads (WA-MEJ-12) —
+  // mismo endpoint para no duplicar esta lógica en dos lugares. Secuencial
+  // (no Promise.all) para no saturar la tasa de envío de Meta y para poder
+  // guardar en `emp_whatsapp_envios_masivos.detalle` exactamente qué pasó
+  // con cada destinatario.
+  router.post("/send-template-masivo", async (req, res) => {
+    const { tenantId, templateName, language, variables, destinatarios, agenteId } = req.body || {};
+
+    const faltantes = [];
+    if (!tenantId) faltantes.push("tenantId");
+    if (!templateName) faltantes.push("templateName");
+    if (!language) faltantes.push("language");
+    if (!Array.isArray(destinatarios) || destinatarios.length === 0) faltantes.push("destinatarios");
+    if (faltantes.length) {
+      console.warn("[whatsapp] /send-template-masivo rechazado, faltan campos:", faltantes.join(", "));
+      return res.status(400).json({ error: `Faltan datos para el envío masivo: ${faltantes.join(", ")}`, faltantes });
+    }
+
+    try {
+      const { plantillas } = await obtenerPlantillasAprobadas();
+      const plantilla = plantillas.find(p => p.name === templateName && p.language === language);
+      if (!plantilla) {
+        return res.status(400).json({ ok: false, error: `La plantilla "${templateName}" (${language}) no está aprobada o no existe.` });
+      }
+      if (plantilla.body.variables > 0 && (!Array.isArray(variables) || variables.length < plantilla.body.variables || variables.some(v => !String(v || "").trim()))) {
+        return res.status(400).json({ ok: false, error: `Faltan completar variables de la plantilla (necesita ${plantilla.body.variables}).` });
+      }
+
+      // Fila de seguimiento en emp_whatsapp_envios_masivos, creada ANTES de
+      // empezar a mandar — así si el envío es largo se puede consultar el
+      // avance directo en Supabase mientras corre, no solo al terminar.
+      const envioRows = await sbWrite("emp_whatsapp_envios_masivos", "POST", {
+        tenant_id: tenantId,
+        agente_id: agenteId || null,
+        template_name: templateName,
+        template_lang: language,
+        total: destinatarios.length,
+        enviados: 0,
+        fallidos: 0,
+        detalle: [],
+      });
+      const envio = envioRows[0];
+
+      const componentesEnvio = armarComponentesEnvio(plantilla, variables);
+      const preview = renderizarPreviewPlantilla(plantilla, variables);
+      const detalle = [];
+      let enviados = 0, fallidos = 0;
+
+      for (const dest of destinatarios) {
+        const telefono = soloDigitos(dest.telefono || "");
+        if (!telefono) {
+          detalle.push({ telefono: dest.telefono || null, leadId: dest.leadId || null, ok: false, error: "Teléfono inválido" });
+          fallidos++;
+          continue;
+        }
+        try {
+          const result = await sendTemplateMessage(telefono, templateName, language, componentesEnvio);
+          const waMessageId = result?.messages?.[0]?.id || null;
+          const simulado = !!result?.__simulado;
+
+          const conv = await getOrCreateConversacion(tenantId, telefono, null);
+          if (dest.leadId && !conv.lead_id) {
+            await sbWrite("emp_whatsapp_conversaciones", "PATCH", { lead_id: dest.leadId }, `?id=eq.${conv.id}`).catch(() => {});
+          }
+          await sbWrite("emp_whatsapp_mensajes", "POST", {
+            conversacion_id: conv.id,
+            direccion: "saliente",
+            cuerpo: preview,
+            wa_message_id: waMessageId,
+            estado: simulado ? "simulado" : "enviado",
+            agente_id: agenteId || null,
+            tipo: "template",
+            template_name: templateName,
+            media_id: plantilla.header?.mediaHandle || null,
+            media_tipo: plantilla.header?.formato ? plantilla.header.formato.toLowerCase() : null,
+          });
+          await actualizarUltimoMensaje(conv.id, simulado ? `[PRUEBA] ${preview}` : preview, "saliente", false);
+
+          detalle.push({ telefono, leadId: dest.leadId || null, ok: true, simulado, waMessageId });
+          enviados++;
+        } catch (e) {
+          detalle.push({ telefono, leadId: dest.leadId || null, ok: false, error: e.message });
+          fallidos++;
+        }
+        // Pausa chica entre cada envío — throttle simple para no pegarle a la
+        // Graph API de Meta de una sola vez en listas grandes.
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      await sbWrite("emp_whatsapp_envios_masivos", "PATCH", { enviados, fallidos, detalle }, `?id=eq.${envio.id}`).catch(() => {});
+
+      console.log(`[whatsapp] Envío masivo "${templateName}" (tenant ${tenantId}): ${enviados} ok, ${fallidos} fallidos de ${destinatarios.length}`);
+      res.json({ ok: true, envioId: envio.id, total: destinatarios.length, enviados, fallidos, detalle });
+    } catch (e) {
+      console.error("[whatsapp] Error en /send-template-masivo:", e.message);
       res.status(500).json({ ok: false, error: e.message });
     }
   });
