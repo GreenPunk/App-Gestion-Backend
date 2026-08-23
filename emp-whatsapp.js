@@ -10,10 +10,17 @@
  *   WHATSAPP_TOKEN            → token permanente del System User de Meta
  *   WHATSAPP_PHONE_NUMBER_ID  → Phone Number ID (Meta App Dashboard → WhatsApp → API Setup)
  *   WHATSAPP_VERIFY_TOKEN     → string inventado por vos, para el handshake del webhook
+ *   WHATSAPP_WABA_ID          → WhatsApp Business Account ID (Meta Business Manager →
+ *                                configuración de WABA — distinto del PHONE_NUMBER_ID de
+ *                                arriba). Hace falta solo para WA-MEJ-04 (traer plantillas).
  *
- * Tablas nuevas en Supabase (ver migracion_whatsapp.sql):
- *   emp_whatsapp_conversaciones
- *   emp_whatsapp_mensajes
+ * Tablas en Supabase (confirmado 2026-08-22 vía Supabase MCP — el esquema ya
+ * tiene TODO lo necesario para plantillas y envío masivo, así que este
+ * archivo escribe directo sobre esas columnas, sin migración pendiente):
+ *   emp_whatsapp_conversaciones (+ ultimo_entrante_fecha, para la ventana de 24hs)
+ *   emp_whatsapp_mensajes (+ tipo: texto|template|media, template_name,
+ *                            media_url/media_id/media_tipo/media_nombre)
+ *   emp_whatsapp_envios_masivos (para WA-MEJ-03, todavía sin usar acá)
  *   tenants.whatsapp_phone_number_id  (columna nueva, para resolver el tenant
  *                                       desde el webhook de Meta)
  * ─────────────────────────────────────────────────────────────
@@ -23,6 +30,15 @@ const express = require("express");
 
 const GRAPH_VERSION = "v21.0";
 const GRAPH_URL = `https://graph.facebook.com/${GRAPH_VERSION}`;
+
+// Cache en memoria de las plantillas aprobadas — Meta no espera que se
+// consulte esto en cada tecla que escribe el agente, y el listado cambia
+// poco (solo cuando se aprueba/rechaza algo en Meta Business). 5 minutos
+// alcanza para que el selector del panel se sienta actualizado sin pegarle
+// a la Graph API de más. Se invalida sola por tiempo, no hace falta lógica
+// de invalidación manual.
+const PLANTILLAS_CACHE_MS = 5 * 60 * 1000;
+let plantillasCache = { data: null, ts: 0 };
 
 module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
   const router = express.Router();
@@ -103,6 +119,207 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
     return data;
   }
 
+  // ── WA-MEJ-04: plantillas aprobadas por Meta ──────────────────
+  // Mismo criterio de "modo prueba" que sendTextMessage: si falta
+  // WHATSAPP_WABA_ID (además de TOKEN/PHONE_NUMBER_ID), no tiene sentido
+  // pegarle a Meta — se sirve un set fijo de plantillas de ejemplo para
+  // poder construir y probar el selector del panel ya mismo. El día que
+  // se cargue WHATSAPP_WABA_ID en Render, esto pasa solo a traer las
+  // reales — no hace falta tocar código.
+  function credencialesPlantillasConfiguradas() {
+    return credencialesMetaConfiguradas() && !!process.env.WHATSAPP_WABA_ID;
+  }
+
+  function plantillasSimuladas() {
+    return [
+      {
+        name: "bienvenida_lead_frio",
+        language: "es_AR",
+        category: "MARKETING",
+        header: null,
+        body: { texto: "Hola {{1}}! Vi que consultaste por {{2}}. Te comparto la info — cualquier duda, escribime por acá.", variables: 2 },
+        footer: "Inmobiliaria Álvarez",
+        botones: [],
+        __simulado: true,
+      },
+      {
+        name: "info_emprendimiento_folleto",
+        language: "es_AR",
+        category: "MARKETING",
+        header: { formato: "IMAGE", texto: null, mediaHandle: "SIMULADO-MEDIA-HANDLE" },
+        body: { texto: "Hola {{1}}! Te adjunto el folleto de {{2}} con precios y financiación vigente.", variables: 2 },
+        footer: null,
+        botones: [],
+        __simulado: true,
+      },
+      {
+        name: "recordatorio_visita",
+        language: "es_AR",
+        category: "UTILITY",
+        header: { formato: "TEXT", texto: "Recordatorio de visita", mediaHandle: null },
+        body: { texto: "Hola {{1}}, te confirmamos la visita para el {{2}} a las {{3}}. Cualquier cambio avisanos.", variables: 3 },
+        footer: null,
+        botones: [],
+        __simulado: true,
+      },
+    ];
+  }
+
+  // Convierte el formato crudo de la Graph API de Meta (array de
+  // `components` con type HEADER/BODY/FOOTER/BUTTONS) a una forma simple
+  // que el frontend puede usar directo para armar el selector y los
+  // inputs de variables, sin tener que conocer la estructura de Meta.
+  function normalizarPlantilla(raw) {
+    const comps = raw.components || [];
+    const headerComp = comps.find(c => c.type === "HEADER");
+    const bodyComp = comps.find(c => c.type === "BODY") || { text: "" };
+    const footerComp = comps.find(c => c.type === "FOOTER");
+    const botonesComp = comps.find(c => c.type === "BUTTONS");
+
+    let header = null;
+    if (headerComp) {
+      if (headerComp.format === "TEXT") {
+        header = { formato: "TEXT", texto: headerComp.text || "", mediaHandle: null };
+      } else if (["IMAGE", "VIDEO", "DOCUMENT"].includes(headerComp.format)) {
+        // El handle que Meta guarda en el `example` de la plantilla es el
+        // mismo archivo que se subió y quedó aprobado junto con el texto —
+        // por eso alcanza con esto para mandar el header, sin pedirle a
+        // el agente que adjunte nada de nuevo cada vez que envía.
+        const handle = headerComp.example?.header_handle?.[0] || null;
+        header = { formato: headerComp.format, texto: null, mediaHandle: handle };
+      }
+    }
+
+    const textoBody = bodyComp.text || "";
+    const variablesEnBody = new Set((textoBody.match(/\{\{\d+\}\}/g) || []));
+
+    return {
+      name: raw.name,
+      language: raw.language,
+      category: raw.category,
+      status: raw.status,
+      header,
+      body: { texto: textoBody, variables: variablesEnBody.size },
+      footer: footerComp?.text || null,
+      botones: (botonesComp?.buttons || []).map(b => ({ tipo: b.type, texto: b.text || null })),
+    };
+  }
+
+  async function fetchPlantillasDeTodasLasPaginas(url, token) {
+    let plantillas = [];
+    let next = url;
+    let paginas = 0;
+    while (next && paginas < 10) { // tope de seguridad — 10 páginas (~2000 plantillas) más que de sobra
+      const res = await fetch(next, { headers: { "Authorization": `Bearer ${token}` } });
+      const data = await res.json();
+      if (!res.ok) {
+        const msg = data?.error?.message || JSON.stringify(data);
+        throw new Error(`WhatsApp API error (plantillas): ${msg}`);
+      }
+      plantillas = plantillas.concat(data.data || []);
+      next = data.paging?.next || null;
+      paginas++;
+    }
+    return plantillas;
+  }
+
+  // Trae las plantillas APPROVED de Meta (con cache de 5 min) o, si todavía
+  // no hay WABA_ID/token cargados, devuelve el set simulado — así el mismo
+  // llamador (la ruta GET /templates y también POST /send-template, que
+  // necesita encontrar la definición de la plantilla elegida) funciona
+  // igual en los dos modos sin lógica duplicada.
+  async function obtenerPlantillasAprobadas() {
+    if (!credencialesPlantillasConfiguradas()) {
+      return { plantillas: plantillasSimuladas(), simulado: true };
+    }
+    const ahora = Date.now();
+    if (plantillasCache.data && (ahora - plantillasCache.ts) < PLANTILLAS_CACHE_MS) {
+      return { plantillas: plantillasCache.data, simulado: false };
+    }
+    const token = requireEnv("WHATSAPP_TOKEN");
+    const wabaId = requireEnv("WHATSAPP_WABA_ID");
+    const url = `${GRAPH_URL}/${wabaId}/message_templates?fields=name,language,status,category,components&limit=250`;
+    const crudas = await fetchPlantillasDeTodasLasPaginas(url, token);
+    const aprobadas = crudas.filter(t => t.status === "APPROVED").map(normalizarPlantilla);
+    plantillasCache = { data: aprobadas, ts: ahora };
+    return { plantillas: aprobadas, simulado: false };
+  }
+
+  // ── Envío de un mensaje de plantilla ───────────────────────────
+  // `componentesDeEnvio` ya viene armado (header con media si corresponde,
+  // body con las variables completadas) — ver la ruta /send-template.
+  async function sendTemplateMessage(to, templateName, languageCode, componentesDeEnvio) {
+    if (!credencialesMetaConfiguradas()) {
+      console.warn("[whatsapp] Modo prueba: se simula el envío de la plantilla, no se llama a Meta.");
+      return {
+        messaging_product: "whatsapp",
+        messages: [{ id: `SIMULADO-${Date.now()}` }],
+        __simulado: true,
+      };
+    }
+
+    const token = requireEnv("WHATSAPP_TOKEN");
+    const phoneNumberId = requireEnv("WHATSAPP_PHONE_NUMBER_ID");
+
+    const res = await fetch(`${GRAPH_URL}/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to,
+        type: "template",
+        template: {
+          name: templateName,
+          language: { code: languageCode },
+          components: componentesDeEnvio,
+        },
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const msg = data?.error?.message || JSON.stringify(data);
+      throw new Error(`WhatsApp API error (plantilla): ${msg}`);
+    }
+    return data;
+  }
+
+  // Arma el array `components` que espera Meta a partir de la plantilla ya
+  // normalizada + las variables que completó el agente en el panel. El
+  // header de media (si la plantilla tiene uno) sale del propio
+  // `mediaHandle` que ya trajo la plantilla aprobada — nunca de un archivo
+  // que suba el agente en el momento.
+  function armarComponentesEnvio(plantilla, variables) {
+    const componentes = [];
+    if (plantilla.header?.mediaHandle) {
+      const tipo = plantilla.header.formato.toLowerCase(); // image | video | document
+      componentes.push({
+        type: "header",
+        parameters: [{ type: tipo, [tipo]: { id: plantilla.header.mediaHandle } }],
+      });
+    }
+    if (plantilla.body.variables > 0) {
+      componentes.push({
+        type: "body",
+        parameters: (variables || []).map(v => ({ type: "text", text: String(v ?? "") })),
+      });
+    }
+    return componentes;
+  }
+
+  // Reemplaza {{1}}, {{2}}... del body por las variables completadas, para
+  // guardar un preview legible en `cuerpo` (bitácora del lead, inbox) en
+  // vez de guardar el texto crudo de Meta con los placeholders sin llenar.
+  function renderizarPreviewPlantilla(plantilla, variables) {
+    let texto = plantilla.body.texto;
+    (variables || []).forEach((v, i) => {
+      texto = texto.replace(new RegExp(`\\{\\{${i + 1}\\}\\}`, "g"), v || `{{${i + 1}}}`);
+    });
+    return texto;
+  }
+
   // ── Matching de lead por teléfono ────────────────────────────
   // WA-BUG-03: el teléfono del lead en emp_leads suele estar cargado con
   // formato humano ("011 3430-3463"), pero el que manda Meta es solo
@@ -153,12 +370,21 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
   async function actualizarUltimoMensaje(conversacionId, texto, direccion, incrementarNoLeidos) {
     const conv = await sbQuery("emp_whatsapp_conversaciones", `id=eq.${conversacionId}&select=no_leidos`);
     const noLeidos = incrementarNoLeidos ? (conv[0]?.no_leidos || 0) + 1 : conv[0]?.no_leidos || 0;
-    return sbWrite("emp_whatsapp_conversaciones", "PATCH", {
+    const ahora = new Date().toISOString();
+    const patch = {
       ultimo_mensaje: texto,
       ultimo_mensaje_direccion: direccion,
-      ultimo_mensaje_fecha: new Date().toISOString(),
+      ultimo_mensaje_fecha: ahora,
       no_leidos: noLeidos,
-    }, `?id=eq.${conversacionId}`);
+    };
+    // WA-MEJ-04/09: la ventana de 24hs para mandar texto libre se abre con
+    // el ÚLTIMO MENSAJE DEL CONTACTO puntualmente, no con el último mensaje
+    // de la conversación en general (que puede ser nuestro, y no reabre
+    // nada). Por eso se guarda aparte y solo se pisa cuando el mensaje que
+    // llega es "entrante" — si el agente responde después, esta fecha no
+    // se toca, así la ventana sigue contando desde que escribió el cliente.
+    if (direccion === "entrante") patch.ultimo_entrante_fecha = ahora;
+    return sbWrite("emp_whatsapp_conversaciones", "PATCH", patch, `?id=eq.${conversacionId}`);
   }
 
   async function resolverTenantPorPhoneNumberId(phoneNumberId) {
@@ -261,6 +487,7 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
         wa_message_id: waMessageId,
         estado: simulado ? "simulado" : "enviado",
         agente_id: agenteId || null,
+        tipo: "texto",
       });
       await actualizarUltimoMensaje(conv.id, simulado ? `[PRUEBA] ${mensaje}` : mensaje, "saliente", false);
 
@@ -270,6 +497,92 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
       res.json({ ok: true, waMessageId, simulado });
     } catch (e) {
       console.error("[whatsapp] Error en /send:", e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // ── GET /api/whatsapp/templates — WA-MEJ-04 ───────────────────
+  // Trae las plantillas APPROVED (de Meta, o simuladas en modo prueba) ya
+  // normalizadas para que el selector del panel no tenga que entender la
+  // estructura de `components` de Meta. tenantId va en la query solo para
+  // loguear/futura multi-WABA — hoy el WABA es uno solo por variable de
+  // entorno, compartido por todos los tenants de esta instancia.
+  router.get("/templates", async (req, res) => {
+    const { tenantId } = req.query || {};
+    if (!tenantId) {
+      return res.status(400).json({ ok: false, error: "Falta tenantId" });
+    }
+    try {
+      const { plantillas, simulado } = await obtenerPlantillasAprobadas();
+      if (simulado) {
+        console.log(`[whatsapp] /templates: modo prueba (falta WHATSAPP_WABA_ID o credenciales) — sirviendo ${plantillas.length} plantillas simuladas.`);
+      }
+      res.json({ ok: true, simulado, plantillas });
+    } catch (e) {
+      console.error("[whatsapp] Error en /templates:", e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // ── POST /api/whatsapp/send-template — WA-MEJ-04 ──────────────
+  // Manda un mensaje de plantilla aprobada. Si la plantilla tiene un
+  // header de imagen/video/documento, se manda automáticamente con el
+  // mismo archivo que quedó aprobado junto al texto (mediaHandle) — el
+  // agente no adjunta nada acá, solo completa las variables del body.
+  router.post("/send-template", async (req, res) => {
+    const { tenantId, telefono, templateName, language, variables, leadId, agenteId } = req.body || {};
+
+    const faltantes = [];
+    if (!tenantId) faltantes.push("tenantId");
+    if (!telefono) faltantes.push("telefono");
+    if (!templateName) faltantes.push("templateName");
+    if (!language) faltantes.push("language");
+    if (faltantes.length) {
+      console.warn("[whatsapp] /send-template rechazado, faltan campos:", faltantes.join(", "));
+      return res.status(400).json({ error: `Faltan datos para enviar: ${faltantes.join(", ")}`, faltantes });
+    }
+
+    try {
+      const { plantillas } = await obtenerPlantillasAprobadas();
+      const plantilla = plantillas.find(p => p.name === templateName && p.language === language);
+      if (!plantilla) {
+        return res.status(400).json({ ok: false, error: `La plantilla "${templateName}" (${language}) no está aprobada o no existe.` });
+      }
+      if (plantilla.body.variables > 0 && (!Array.isArray(variables) || variables.length < plantilla.body.variables || variables.some(v => !String(v || "").trim()))) {
+        return res.status(400).json({ ok: false, error: `Faltan completar variables de la plantilla (necesita ${plantilla.body.variables}).` });
+      }
+
+      const componentesEnvio = armarComponentesEnvio(plantilla, variables);
+      const result = await sendTemplateMessage(telefono, templateName, language, componentesEnvio);
+      const waMessageId = result?.messages?.[0]?.id || null;
+      const simulado = !!result?.__simulado;
+      const preview = renderizarPreviewPlantilla(plantilla, variables);
+
+      const conv = await getOrCreateConversacion(tenantId, telefono, null);
+      if (leadId && !conv.lead_id) {
+        await sbWrite("emp_whatsapp_conversaciones", "PATCH", { lead_id: leadId }, `?id=eq.${conv.id}`).catch(() => {});
+      }
+
+      await sbWrite("emp_whatsapp_mensajes", "POST", {
+        conversacion_id: conv.id,
+        direccion: "saliente",
+        cuerpo: preview,
+        wa_message_id: waMessageId,
+        estado: simulado ? "simulado" : "enviado",
+        agente_id: agenteId || null,
+        tipo: "template",
+        template_name: templateName,
+        media_id: plantilla.header?.mediaHandle || null,
+        media_tipo: plantilla.header?.formato ? plantilla.header.formato.toLowerCase() : null,
+      });
+      await actualizarUltimoMensaje(conv.id, simulado ? `[PRUEBA] ${preview}` : preview, "saliente", false);
+
+      console.log(simulado
+        ? `[whatsapp] Plantilla SIMULADA (falta configurar Meta/WABA_ID) "${templateName}" a ${telefono} (tenant ${tenantId})`
+        : `[whatsapp] Plantilla "${templateName}" enviada a ${telefono} (tenant ${tenantId})`);
+      res.json({ ok: true, waMessageId, simulado });
+    } catch (e) {
+      console.error("[whatsapp] Error en /send-template:", e.message);
       res.status(500).json({ ok: false, error: e.message });
     }
   });
