@@ -807,9 +807,15 @@ backticks, con esta forma exacta:
 
 Si un campo no aparece en el resumen o no podés leerlo con confianza, poné null en ese campo — no inventes valores. No agregues campos extra.`,
 
-  // Mismo formato que "visa" — reutiliza el prompt de Visa cambiando la
-  // referencia de marca, tal como quedó decidido en el plan del módulo
-  // (Consumos de Servicios, "Tarjetas — Mastercard sumada como fuente").
+  // A diferencia de "visa", el resumen consolidado de Mastercard trae VARIOS
+  // números parecidos en la misma sección ("Total consumos del mes",
+  // "Subtotal", "Saldo actual", "Pago mínimo") y la IA venía confundiendo
+  // "Total consumos del mes" con el importe real a pagar. El dato correcto
+  // es SIEMPRE la fila "SALDO ACTUAL" (suele venir resaltada en negrita, es
+  // la que ya incluye saldo anterior + consumos del mes + impuesto de
+  // sellos, y puede dar NEGATIVA cuando hay saldo a favor por haber pagado
+  // de más el mes anterior — ese signo negativo hay que conservarlo, no es
+  // un error).
   mastercard: `Sos un extractor de datos de resúmenes de tarjeta Mastercard (Argentina), para
 seguir el pago del alquiler/gastos en dólares. Te paso la imagen o PDF del
 resumen. Devolvé ÚNICAMENTE un objeto JSON, sin texto antes ni después, sin
@@ -818,8 +824,8 @@ backticks, con esta forma exacta:
 {
   "anio": <número, año del cierre>,
   "mes": <número 1-12, mes del cierre>,
-  "total_pesos": <número, total del resumen en pesos argentinos>,
-  "total_dolares": <número, total en dólares si figura algún consumo/cuota en esa moneda>,
+  "total_pesos": <número, el importe de la fila "SALDO ACTUAL" (normalmente resaltada en negrita, en la columna "PESOS") — ESE es el monto a pagar, NO "Total consumos del mes" ni "Subtotal" ni "Saldo pendiente". "Saldo actual" puede ser NEGATIVO si hay saldo a favor (se pagó de más el resumen anterior) — en ese caso devolvé el número negativo, no lo pases a positivo>,
+  "total_dolares": <número, el importe de esa misma fila "SALDO ACTUAL" pero en la columna "DÓLARES" — no el total de consumos en dólares>,
   "cotizacion_aplicada": <número, tipo de cambio usado para convertir el consumo en dólares a pesos, si figura>,
   "fecha_cierre": <"YYYY-MM-DD", fecha de cierre del resumen>,
   "fecha_vencimiento": <"YYYY-MM-DD", fecha de vencimiento del pago>,
