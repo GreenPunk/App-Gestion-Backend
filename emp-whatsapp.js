@@ -293,6 +293,53 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
     return data;
   }
 
+  // ── WA-MEJ-02: mandar un archivo (imagen/video/audio/documento) ──────
+  // Se manda por `link` (URL pública https), no por `media_id` — el archivo
+  // ya está subido a Supabase Storage (bucket emp-adjuntos, mismo patrón
+  // que DB.subirAdjunto en supabase.js) antes de llegar acá. Es la opción
+  // "menos confiable" según la doc de Meta frente a subir primero a
+  // /media, pero evita tener que parsear multipart en este backend — no
+  // hay ninguna otra ruta acá que reciba archivos, así que no vale la pena
+  // sumar esa complejidad solo para esto.
+  async function sendMediaMessage(to, mediaTipo, link, filename) {
+    if (!credencialesMetaConfiguradas()) {
+      console.warn("[whatsapp] Modo prueba: se simula el envío del archivo, no se llama a Meta.");
+      return {
+        messaging_product: "whatsapp",
+        messages: [{ id: `SIMULADO-${Date.now()}` }],
+        __simulado: true,
+      };
+    }
+
+    const token = requireEnv("WHATSAPP_TOKEN");
+    const phoneNumberId = requireEnv("WHATSAPP_PHONE_NUMBER_ID");
+
+    const mediaObj = { link };
+    // El nombre de archivo solo lo usa Meta para el tipo "document" (así
+    // se ve con nombre real en WhatsApp en vez de un link genérico).
+    if (mediaTipo === "document" && filename) mediaObj.filename = filename;
+
+    const res = await fetch(`${GRAPH_URL}/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to,
+        type: mediaTipo,
+        [mediaTipo]: mediaObj,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const msg = data?.error?.message || JSON.stringify(data);
+      throw new Error(`WhatsApp API error (archivo): ${msg}`);
+    }
+    return data;
+  }
+
   // Arma el array `components` que espera Meta a partir de la plantilla ya
   // normalizada + las variables que completó el agente en el panel. El
   // header de media (si la plantilla tiene uno) sale del propio
@@ -406,6 +453,16 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
     return rows[0]?.id || null;
   }
 
+  // WA-MEJ-02: mismo cálculo que ventanaAbierta() en whatsappApi.js (frontend),
+  // pero server-side — hace falta acá porque /send-media tiene que rechazar
+  // el envío si la ventana está cerrada (mandar un archivo libre fuera de
+  // la ventana no es legal vía Cloud API, ni siquiera Meta lo permitiría).
+  function ventanaAbiertaBackend(conv) {
+    if (!conv?.ultimo_entrante_fecha) return false;
+    const ms = Date.now() - new Date(conv.ultimo_entrante_fecha).getTime();
+    return ms < 24 * 60 * 60 * 1000;
+  }
+
   // ── GET /api/whatsapp/webhook — handshake de verificación ───
   router.get("/webhook", (req, res) => {
     const mode = req.query["hub.mode"];
@@ -510,6 +567,68 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
       res.json({ ok: true, waMessageId, simulado });
     } catch (e) {
       console.error("[whatsapp] Error en /send:", e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // ── POST /api/whatsapp/send-media — WA-MEJ-02 ─────────────────
+  // El archivo ya está subido a Supabase Storage del lado del frontend
+  // (DB.subirAdjunto) antes de llegar acá — este endpoint solo recibe la
+  // URL pública y se la pasa a Meta. Igual que /send (texto libre), solo
+  // funciona con la ventana de 24hs abierta: si está cerrada, Meta no
+  // acepta contenido libre y hace falta una plantilla con media aprobada
+  // (eso ya existe, ver /send-template con header IMAGE/VIDEO/DOCUMENT).
+  router.post("/send-media", async (req, res) => {
+    const { tenantId, telefono, mediaUrl, mediaTipo, filename, leadId, agenteId } = req.body || {};
+
+    const faltantes = [];
+    if (!tenantId) faltantes.push("tenantId");
+    if (!telefono) faltantes.push("telefono");
+    if (!mediaUrl) faltantes.push("mediaUrl");
+    if (!["image", "video", "audio", "document"].includes(mediaTipo)) faltantes.push("mediaTipo");
+    if (faltantes.length) {
+      console.warn("[whatsapp] /send-media rechazado, faltan campos:", faltantes.join(", "));
+      return res.status(400).json({ error: `Faltan datos para enviar el archivo: ${faltantes.join(", ")}`, faltantes });
+    }
+
+    try {
+      const conv = await getOrCreateConversacion(tenantId, telefono, null);
+      if (!ventanaAbiertaBackend(conv)) {
+        return res.status(400).json({
+          ok: false,
+          error: "La ventana de 24hs con este contacto está cerrada — no se puede mandar un archivo libre. Hace falta una plantilla aprobada con header de media.",
+        });
+      }
+
+      const result = await sendMediaMessage(telefono, mediaTipo, mediaUrl, filename);
+      const waMessageId = result?.messages?.[0]?.id || null;
+      const simulado = !!result?.__simulado;
+
+      if (leadId && !conv.lead_id) {
+        await sbWrite("emp_whatsapp_conversaciones", "PATCH", { lead_id: leadId }, `?id=eq.${conv.id}`).catch(() => {});
+      }
+
+      const preview = `📎 ${filename || "archivo"}`;
+      await sbWrite("emp_whatsapp_mensajes", "POST", {
+        conversacion_id: conv.id,
+        direccion: "saliente",
+        cuerpo: preview,
+        wa_message_id: waMessageId,
+        estado: simulado ? "simulado" : "enviado",
+        agente_id: agenteId || null,
+        tipo: "media",
+        media_url: mediaUrl,
+        media_tipo: mediaTipo,
+        media_nombre: filename || null,
+      });
+      await actualizarUltimoMensaje(conv.id, simulado ? `[PRUEBA] ${preview}` : preview, "saliente", false);
+
+      console.log(simulado
+        ? `[whatsapp] Archivo SIMULADO (falta configurar Meta) a ${telefono} (tenant ${tenantId})`
+        : `[whatsapp] Archivo (${mediaTipo}) enviado a ${telefono} (tenant ${tenantId})`);
+      res.json({ ok: true, waMessageId, simulado });
+    } catch (e) {
+      console.error("[whatsapp] Error en /send-media:", e.message);
       res.status(500).json({ ok: false, error: e.message });
     }
   });
