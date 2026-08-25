@@ -340,6 +340,90 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
     return data;
   }
 
+  // ── WA-MEJ-20: recepción real de multimedia entrante ─────────────────
+  // Hasta ahora el webhook guardaba `[image]`/`[video]`/etc. como texto
+  // plano para cualquier mensaje que no fuera texto — el archivo en sí se
+  // perdía. Meta no manda el archivo en el webhook, solo un `media_id`
+  // (válido ~7 días) que hay que resolver en 2 pasos: 1) pedirle a la
+  // Graph API la URL temporal real del archivo, 2) descargar esa URL con
+  // el mismo token (si no, da 401). Esa URL temporal no sirve para
+  // guardarla tal cual en `emp_whatsapp_mensajes.media_url` porque expira
+  // — por eso se descarga el binario acá mismo y se resube a Supabase
+  // Storage (mismo bucket `emp-adjuntos` que ya usa WA-MEJ-02 para lo que
+  // manda el agente), y se guarda esa URL pública, que no vence.
+  function extensionDesdeMime(mime) {
+    const mapa = {
+      "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+      "video/mp4": "mp4", "video/3gpp": "3gp",
+      "audio/ogg": "ogg", "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/amr": "amr",
+      "application/pdf": "pdf",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+      "application/msword": "doc",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+      "application/vnd.ms-excel": "xls",
+    };
+    return mapa[mime] || "bin";
+  }
+
+  async function descargarMediaEntrante(mediaId) {
+    if (!credencialesMetaConfiguradas()) {
+      throw new Error("Sin credenciales de Meta configuradas todavía — no se puede descargar el archivo entrante (modo prueba).");
+    }
+    const token = requireEnv("WHATSAPP_TOKEN");
+
+    // Paso 1: resolver la URL temporal real a partir del media_id.
+    const metaRes = await fetch(`${GRAPH_URL}/${mediaId}`, {
+      headers: { "Authorization": `Bearer ${token}` },
+    });
+    const metaData = await metaRes.json();
+    if (!metaRes.ok) {
+      throw new Error(`Error al resolver la media de Meta: ${metaData?.error?.message || JSON.stringify(metaData)}`);
+    }
+
+    // Límite de seguridad genérico (100MB, el más alto de los que Meta
+    // documenta — para documentos). No hace falta discriminar por tipo acá:
+    // si Meta lo dejó pasar del lado del contacto, ya viene dentro de sus
+    // propios límites; esto es solo para no cargar algo absurdo en memoria.
+    const tamano = Number(metaData.file_size || 0);
+    if (tamano > 100 * 1024 * 1024) {
+      throw new Error(`El archivo entrante pesa ${(tamano / 1024 / 1024).toFixed(0)}MB, supera el límite esperado.`);
+    }
+
+    // Paso 2: descargar el binario con el mismo token (Meta exige
+    // Authorization también acá, no es una URL pública común).
+    const fileRes = await fetch(metaData.url, {
+      headers: { "Authorization": `Bearer ${token}` },
+    });
+    if (!fileRes.ok) {
+      throw new Error(`Error al descargar el archivo de Meta (HTTP ${fileRes.status})`);
+    }
+    const arrayBuffer = await fileRes.arrayBuffer();
+    return {
+      buffer: Buffer.from(arrayBuffer),
+      mimeType: metaData.mime_type || fileRes.headers.get("content-type") || "application/octet-stream",
+    };
+  }
+
+  async function subirMediaEntranteASupabase(tenantId, conversacionId, mediaId, buffer, mimeType) {
+    const ext = extensionDesdeMime(mimeType);
+    const path = `whatsapp-in/${tenantId}/${conversacionId}/${mediaId}.${ext}`;
+    const res = await fetch(`${SB_URL}/storage/v1/object/emp-adjuntos/${path}`, {
+      method: "POST",
+      headers: {
+        "apikey": SB_KEY,
+        "Authorization": `Bearer ${SB_KEY}`,
+        "Content-Type": mimeType || "application/octet-stream",
+        "x-upsert": "true",
+      },
+      body: buffer,
+    });
+    if (!res.ok) {
+      const e = await res.text();
+      throw new Error(`Supabase Storage upload error ${res.status}: ${e}`);
+    }
+    return `${SB_URL}/storage/v1/object/public/emp-adjuntos/${path}`;
+  }
+
   // Arma el array `components` que espera Meta a partir de la plantilla ya
   // normalizada + las variables que completó el agente en el panel. El
   // header de media (si la plantilla tiene uno) sale del propio
@@ -496,17 +580,54 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
         for (const msg of value.messages) {
           const telefono = msg.from;
           const nombreContacto = value.contacts?.[0]?.profile?.name || null;
-          const texto = msg.text?.body || `[${msg.type}]`;
-
           const conv = await getOrCreateConversacion(tenantId, telefono, nombreContacto);
+
+          // WA-MEJ-20: tipos de media que Meta puede mandar en un mensaje
+          // entrante. "sticker" se guarda como si fuera imagen (mismo
+          // render en el panel: no hay burbuja especial para stickers).
+          const TIPOS_MEDIA = ["image", "video", "audio", "document", "sticker"];
+          const esMedia = TIPOS_MEDIA.includes(msg.type) && msg[msg.type]?.id;
+
+          let cuerpo;
+          let camposExtra = {};
+
+          if (esMedia) {
+            const mediaId = msg[msg.type].id;
+            const caption = msg[msg.type].caption || null;
+            const filename = msg[msg.type].filename || null;
+            const mediaTipoGuardado = msg.type === "sticker" ? "image" : msg.type;
+            try {
+              const { buffer, mimeType } = await descargarMediaEntrante(mediaId);
+              const mediaUrl = await subirMediaEntranteASupabase(tenantId, conv.id, mediaId, buffer, mimeType);
+              cuerpo = caption || `📎 ${filename || mediaTipoGuardado}`;
+              camposExtra = {
+                tipo: "media",
+                media_url: mediaUrl,
+                media_id: mediaId,
+                media_tipo: mediaTipoGuardado,
+                media_nombre: filename || null,
+              };
+            } catch (e) {
+              // No se pudo bajar el archivo (sin credenciales todavía, medio
+              // caído, media_id vencido, etc.) — no se pierde el mensaje
+              // entero, se guarda como antes (texto plano) para no romper
+              // el inbox, pero queda logueado el motivo puntual.
+              console.error(`[whatsapp] No se pudo descargar media entrante (${msg.type}, ${mediaId}):`, e.message);
+              cuerpo = `[${msg.type}] (no se pudo descargar: ${e.message})`;
+            }
+          } else {
+            cuerpo = msg.text?.body || `[${msg.type}]`;
+          }
+
           await sbWrite("emp_whatsapp_mensajes", "POST", {
             conversacion_id: conv.id,
             direccion: "entrante",
-            cuerpo: texto,
+            cuerpo,
             wa_message_id: msg.id,
+            ...camposExtra,
           });
-          await actualizarUltimoMensaje(conv.id, texto, "entrante", true);
-          console.log(`[whatsapp] Mensaje entrante de ${telefono} (tenant ${tenantId}): "${texto}"`);
+          await actualizarUltimoMensaje(conv.id, cuerpo, "entrante", true);
+          console.log(`[whatsapp] Mensaje entrante de ${telefono} (tenant ${tenantId}): "${cuerpo}"`);
         }
       }
 
