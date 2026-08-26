@@ -47,6 +47,15 @@ const GRAPH_URL = `https://graph.facebook.com/${GRAPH_VERSION}`;
 const PLANTILLAS_CACHE_MS = 5 * 60 * 1000;
 let plantillasCache = { data: null, ts: 0 };
 
+// WA-MEJ-31: caché del límite de mensajería — Meta solo revisa/actualiza el
+// tope cada 6hs de su lado (ver OBS-07 en el doc de estado), así que pedirlo
+// más seguido que esto no aporta nada y solo gasta cuota de la Graph API.
+// TTL corto (2 min) porque además es compartido entre todos los agentes que
+// tengan el panel abierto a la vez — sin esto, cada uno dispara su propio
+// pedido a Meta en su propio poll.
+const LIMITE_MENSAJERIA_CACHE_MS = 2 * 60 * 1000;
+let limiteMensajeriaCache = { data: null, ts: 0 };
+
 module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
   const router = express.Router();
 
@@ -750,6 +759,146 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
       res.json({ ok: true, waMessageId, simulado });
     } catch (e) {
       console.error("[whatsapp] Error en /send-media:", e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // ── WA-MEJ-31: contador de mensajes "en frío" disponibles ─────
+  // "En frío" = mensajes business-initiated: una plantilla que le abre
+  // conversación nueva a un contacto con el que no había ningún mensaje
+  // (en ningún sentido) en las 24hs previas. Responder dentro de una
+  // ventana ya abierta, o contestarle a alguien que escribió primero, NO
+  // gasta este límite — por eso no alcanza con contar plantillas mandadas,
+  // hay que mirar si hubo algo antes con ese mismo contacto.
+  //
+  // El TOPE se pide siempre fresco a Meta (con la caché de arriba, corta a
+  // propósito) — nunca se guarda en Supabase ni en ningún lado persistente,
+  // porque Meta lo puede subir o bajar solo según status/calidad/uso, y no
+  // queremos que este número quede desactualizado. Desde oct-2025 Meta lo
+  // expone bajo `whatsapp_business_manager_messaging_limit` (valores tipo
+  // "TIER_250", "TIER_1K", …) — el campo viejo `messaging_limit_tier` está
+  // deprecado. Ver OBS-07 en el documento de estado.
+  const TOPES_MENSAJERIA = {
+    TIER_250: 250,
+    TIER_1K: 1000,
+    TIER_10K: 10000,
+    TIER_100K: 100000,
+    TIER_UNLIMITED: null, // null = sin tope numérico
+  };
+
+  async function consultarTopeMensajeria() {
+    if (!credencialesMetaConfiguradas()) {
+      return { tier: null, tope: null, tierReconocido: false, simulado: true };
+    }
+    const ahora = Date.now();
+    if (limiteMensajeriaCache.data && (ahora - limiteMensajeriaCache.ts) < LIMITE_MENSAJERIA_CACHE_MS) {
+      return limiteMensajeriaCache.data;
+    }
+    const token = requireEnv("WHATSAPP_TOKEN");
+    const phoneNumberId = requireEnv("WHATSAPP_PHONE_NUMBER_ID");
+    const res = await fetch(
+      `${GRAPH_URL}/${phoneNumberId}?fields=whatsapp_business_manager_messaging_limit`,
+      { headers: { "Authorization": `Bearer ${token}` } }
+    );
+    const data = await res.json();
+    if (!res.ok) {
+      const msg = data?.error?.message || JSON.stringify(data);
+      throw new Error(`WhatsApp API error (límite de mensajería): ${msg}`);
+    }
+    const tierRaw = data.whatsapp_business_manager_messaging_limit || null;
+    const tierReconocido = !!(tierRaw && tierRaw in TOPES_MENSAJERIA);
+    const resultado = {
+      tier: tierRaw,
+      tope: tierReconocido ? TOPES_MENSAJERIA[tierRaw] : null,
+      tierReconocido,
+      simulado: false,
+    };
+    limiteMensajeriaCache = { data: resultado, ts: ahora };
+    return resultado;
+  }
+
+  // Cuenta clientes únicos que ya "gastaron" el límite en las últimas 24hs.
+  // Una sola query trayendo una ventana de 48hs de mensajes (sin N+1), todo
+  // el cálculo se hace en memoria. `emp_whatsapp_mensajes` no tiene
+  // tenant_id propio — el tenant sale de a qué conversación pertenece cada
+  // mensaje, por eso primero se resuelven las conversaciones del tenant.
+  async function contarMensajesEnFrioUsados(tenantId) {
+    const conversaciones = await sbQuery(
+      "emp_whatsapp_conversaciones",
+      `tenant_id=eq.${tenantId}&select=id,telefono`
+    );
+    if (!conversaciones.length) return 0;
+
+    const idsPorConv = {};
+    for (const c of conversaciones) idsPorConv[c.id] = c.telefono;
+    const idsConv = conversaciones.map(c => c.id);
+
+    const ahora = Date.now();
+    const VENTANA_24H_MS = 24 * 60 * 60 * 1000;
+    const desde48h = new Date(ahora - 2 * VENTANA_24H_MS).toISOString();
+
+    // El filtro `in.(...)` puede quedar largo con muchas conversaciones —
+    // mismo patrón que ya usa el buscador del panel (WA-MEJ-18) para esto,
+    // no se separó porque en la práctica el volumen de un tenant no llega a
+    // ser un problema real acá.
+    const mensajes = await sbQuery(
+      "emp_whatsapp_mensajes",
+      `conversacion_id=in.(${idsConv.join(",")})&select=conversacion_id,created_at,tipo,direccion&created_at=gte.${desde48h}&order=created_at.asc`
+    );
+
+    const porTelefono = {};
+    for (const m of mensajes) {
+      const telefono = idsPorConv[m.conversacion_id];
+      if (!telefono) continue;
+      (porTelefono[telefono] ||= []).push(m);
+    }
+
+    const desde24h = ahora - VENTANA_24H_MS;
+    let usados = 0;
+    for (const msjs of Object.values(porTelefono)) {
+      for (const m of msjs) {
+        if (m.direccion !== "saliente" || m.tipo !== "template") continue;
+        const ts = new Date(m.created_at).getTime();
+        if (ts < desde24h) continue; // fuera de la ventana que nos interesa mostrar
+        const huboAnterior = msjs.some(x => {
+          const xts = new Date(x.created_at).getTime();
+          return xts < ts && xts >= ts - VENTANA_24H_MS;
+        });
+        if (!huboAnterior) {
+          usados++;
+          break; // ya se contó a este contacto, no hace falta mirar sus otros mensajes
+        }
+      }
+    }
+    return usados;
+  }
+
+  // ── GET /api/whatsapp/limite-mensajeria — WA-MEJ-31 ───────────
+  router.get("/limite-mensajeria", async (req, res) => {
+    const { tenantId } = req.query || {};
+    if (!tenantId) {
+      return res.status(400).json({ ok: false, error: "Falta tenantId" });
+    }
+    try {
+      const [tope, usados] = await Promise.all([
+        consultarTopeMensajeria(),
+        contarMensajesEnFrioUsados(tenantId),
+      ]);
+      if (!tope.tierReconocido && !tope.simulado) {
+        console.warn(`[whatsapp] /limite-mensajeria: Meta devolvió un tier no reconocido ("${tope.tier}") — actualizar TOPES_MENSAJERIA. Ver OBS-07.`);
+      }
+      res.json({
+        ok: true,
+        simulado: tope.simulado,
+        tier: tope.tier,
+        tierReconocido: tope.tierReconocido,
+        tope: tope.tope, // null = sin tope numérico (ilimitado, tier no reconocido, o modo prueba)
+        usados,
+        disponibles: tope.tope == null ? null : Math.max(0, tope.tope - usados),
+        calculadoEn: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.error("[whatsapp] Error en /limite-mensajeria:", e.message);
       res.status(500).json({ ok: false, error: e.message });
     }
   });
