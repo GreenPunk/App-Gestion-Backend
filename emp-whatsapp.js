@@ -434,17 +434,25 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
   }
 
   // Arma el array `components` que espera Meta a partir de la plantilla ya
-  // normalizada + las variables que completó el agente en el panel. El
-  // header de media (si la plantilla tiene uno) sale del propio
-  // `mediaHandle` que ya trajo la plantilla aprobada — nunca de un archivo
-  // que suba el agente en el momento.
-  function armarComponentesEnvio(plantilla, variables) {
+  // normalizada + las variables que completó el agente en el panel.
+  //
+  // [🔴 WA-BUG-05, corregido 2026-08-27] Esta función mandaba
+  // `plantilla.header.mediaHandle` (el `header_handle` que Meta devuelve en
+  // el `example` de la plantilla) como `id` del parámetro de media. Ese
+  // handle es un token de la Resumable Upload API, válido SOLO para crear
+  // la plantilla — no es un media id reutilizable para enviar mensajes.
+  // Meta lo rechaza con "violated JSON schema constraint 'type' ... expected
+  // [integer, null]" porque espera ahí un id numérico real. La solución que
+  // usa Meta para este caso es mandar un `link` público al archivo en cada
+  // envío — por eso ahora recibe `headerMediaUrl` (resuelto en
+  // `resolverHeaderMediaUrl`, ver más abajo) en vez de leer el handle.
+  function armarComponentesEnvio(plantilla, variables, headerMediaUrl) {
     const componentes = [];
     if (plantilla.header?.mediaHandle) {
       const tipo = plantilla.header.formato.toLowerCase(); // image | video | document
       componentes.push({
         type: "header",
-        parameters: [{ type: tipo, [tipo]: { id: plantilla.header.mediaHandle } }],
+        parameters: [{ type: tipo, [tipo]: { link: headerMediaUrl } }],
       });
     }
     if (plantilla.body.variables > 0) {
@@ -454,6 +462,45 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
       });
     }
     return componentes;
+  }
+
+  // [WA-BUG-05] Guarda/actualiza en emp_whatsapp_plantillas_media el link
+  // público a usar para el header de esta plantilla — así el agente lo
+  // pega una sola vez y las próximas veces se reusa solo (ver
+  // resolverHeaderMediaUrl). Best-effort: si falla el guardado no aborta el
+  // envío, que ya salió.
+  async function guardarHeaderMediaUrl(tenantId, plantilla, url) {
+    const filtro = `?tenant_id=eq.${tenantId}&template_name=eq.${encodeURIComponent(plantilla.name)}&language=eq.${encodeURIComponent(plantilla.language)}`;
+    const existentes = await sbQuery(
+      "emp_whatsapp_plantillas_media",
+      `tenant_id=eq.${tenantId}&template_name=eq.${encodeURIComponent(plantilla.name)}&language=eq.${encodeURIComponent(plantilla.language)}&select=tenant_id`
+    ).catch(() => []);
+    if (existentes.length) {
+      await sbWrite("emp_whatsapp_plantillas_media", "PATCH", { media_url: url, updated_at: new Date().toISOString() }, filtro).catch(() => {});
+    } else {
+      await sbWrite("emp_whatsapp_plantillas_media", "POST", { tenant_id: tenantId, template_name: plantilla.name, language: plantilla.language, media_url: url }).catch(() => {});
+    }
+  }
+
+  // [WA-BUG-05] Resuelve qué link público usar para el header de media de
+  // una plantilla, si la tiene. Prioridad: 1) el que mandó el agente en
+  // este mismo envío (y de paso lo guarda para la próxima vez), 2) el que
+  // ya estaba guardado de un envío anterior. Si la plantilla necesita uno y
+  // no hay ninguno de los dos, devuelve null — el llamador (la ruta) es
+  // quien decide cortar con un error claro en vez de mandarle a Meta un
+  // envío que va a fallar.
+  async function resolverHeaderMediaUrl(tenantId, plantilla, headerMediaUrlBody) {
+    if (!plantilla.header?.mediaHandle) return null;
+    if (headerMediaUrlBody && String(headerMediaUrlBody).trim()) {
+      const url = String(headerMediaUrlBody).trim();
+      await guardarHeaderMediaUrl(tenantId, plantilla, url);
+      return url;
+    }
+    const guardadas = await sbQuery(
+      "emp_whatsapp_plantillas_media",
+      `tenant_id=eq.${tenantId}&template_name=eq.${encodeURIComponent(plantilla.name)}&language=eq.${encodeURIComponent(plantilla.language)}&select=media_url`
+    ).catch(() => []);
+    return guardadas[0]?.media_url || null;
   }
 
   // Reemplaza {{1}}, {{2}}... del body por las variables completadas, para
@@ -919,6 +966,22 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
       if (simulado) {
         console.log(`[whatsapp] /templates: modo prueba (falta WHATSAPP_WABA_ID o credenciales) — sirviendo ${plantillas.length} plantillas simuladas.`);
       }
+      // [WA-BUG-05] Si alguna plantilla tiene header de media, se le suma
+      // `mediaUrlGuardada` con el link público que se haya guardado antes
+      // para ella (si nunca se mandó, queda null) — así el selector del
+      // panel puede precargarlo en vez de pedírselo al agente de cero cada
+      // vez.
+      const conMedia = plantillas.filter(p => p.header?.mediaHandle);
+      if (conMedia.length) {
+        const guardadas = await sbQuery(
+          "emp_whatsapp_plantillas_media",
+          `tenant_id=eq.${tenantId}&select=template_name,language,media_url`
+        ).catch(() => []);
+        const mapa = new Map(guardadas.map(g => [`${g.template_name}__${g.language}`, g.media_url]));
+        for (const p of conMedia) {
+          p.header.mediaUrlGuardada = mapa.get(`${p.name}__${p.language}`) || null;
+        }
+      }
       res.json({ ok: true, simulado, plantillas });
     } catch (e) {
       console.error("[whatsapp] Error en /templates:", e.message);
@@ -932,7 +995,7 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
   // mismo archivo que quedó aprobado junto al texto (mediaHandle) — el
   // agente no adjunta nada acá, solo completa las variables del body.
   router.post("/send-template", async (req, res) => {
-    const { tenantId, telefono, templateName, language, variables, leadId, agenteId } = req.body || {};
+    const { tenantId, telefono, templateName, language, variables, leadId, agenteId, headerMediaUrl } = req.body || {};
 
     const faltantes = [];
     if (!tenantId) faltantes.push("tenantId");
@@ -954,7 +1017,18 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
         return res.status(400).json({ ok: false, error: `Faltan completar variables de la plantilla (necesita ${plantilla.body.variables}).` });
       }
 
-      const componentesEnvio = armarComponentesEnvio(plantilla, variables);
+      // [WA-BUG-05] Ver resolverHeaderMediaUrl — el mediaHandle de la
+      // plantilla no sirve como id, hace falta un link público.
+      const urlMedia = await resolverHeaderMediaUrl(tenantId, plantilla, headerMediaUrl);
+      if (plantilla.header?.mediaHandle && !urlMedia) {
+        return res.status(400).json({
+          ok: false,
+          error: `Esta plantilla tiene un header de ${plantilla.header.formato.toLowerCase()} — hace falta un link público al archivo para poder mandarla (se pega una sola vez y queda guardado para la próxima).`,
+          requiereHeaderMediaUrl: true,
+        });
+      }
+
+      const componentesEnvio = armarComponentesEnvio(plantilla, variables, urlMedia);
       const result = await sendTemplateMessage(telefono, templateName, language, componentesEnvio);
       const waMessageId = result?.messages?.[0]?.id || null;
       const simulado = !!result?.__simulado;
@@ -974,7 +1048,7 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
         agente_id: agenteId || null,
         tipo: "template",
         template_name: templateName,
-        media_id: plantilla.header?.mediaHandle || null,
+        media_url: urlMedia || null,
         media_tipo: plantilla.header?.formato ? plantilla.header.formato.toLowerCase() : null,
       });
       await actualizarUltimoMensaje(conv.id, simulado ? `[PRUEBA] ${preview}` : preview, "saliente", false);
@@ -998,7 +1072,7 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
   // guardar en `emp_whatsapp_envios_masivos.detalle` exactamente qué pasó
   // con cada destinatario.
   router.post("/send-template-masivo", async (req, res) => {
-    const { tenantId, templateName, language, variables, destinatarios, agenteId } = req.body || {};
+    const { tenantId, templateName, language, variables, destinatarios, agenteId, headerMediaUrl } = req.body || {};
 
     const faltantes = [];
     if (!tenantId) faltantes.push("tenantId");
@@ -1020,6 +1094,17 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
         return res.status(400).json({ ok: false, error: `Faltan completar variables de la plantilla (necesita ${plantilla.body.variables}).` });
       }
 
+      // [WA-BUG-05] Se resuelve una sola vez para todo el envío masivo (no
+      // por destinatario) — es el mismo header para todos.
+      const urlMedia = await resolverHeaderMediaUrl(tenantId, plantilla, headerMediaUrl);
+      if (plantilla.header?.mediaHandle && !urlMedia) {
+        return res.status(400).json({
+          ok: false,
+          error: `Esta plantilla tiene un header de ${plantilla.header.formato.toLowerCase()} — hace falta un link público al archivo para poder mandarla (se pega una sola vez y queda guardado para la próxima).`,
+          requiereHeaderMediaUrl: true,
+        });
+      }
+
       // Fila de seguimiento en emp_whatsapp_envios_masivos, creada ANTES de
       // empezar a mandar — así si el envío es largo se puede consultar el
       // avance directo en Supabase mientras corre, no solo al terminar.
@@ -1035,7 +1120,7 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
       });
       const envio = envioRows[0];
 
-      const componentesEnvio = armarComponentesEnvio(plantilla, variables);
+      const componentesEnvio = armarComponentesEnvio(plantilla, variables, urlMedia);
       const preview = renderizarPreviewPlantilla(plantilla, variables);
       const detalle = [];
       let enviados = 0, fallidos = 0;
@@ -1065,7 +1150,7 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
             agente_id: agenteId || null,
             tipo: "template",
             template_name: templateName,
-            media_id: plantilla.header?.mediaHandle || null,
+            media_url: urlMedia || null,
             media_tipo: plantilla.header?.formato ? plantilla.header.formato.toLowerCase() : null,
           });
           await actualizarUltimoMensaje(conv.id, simulado ? `[PRUEBA] ${preview}` : preview, "saliente", false);
