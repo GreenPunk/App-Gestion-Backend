@@ -56,7 +56,7 @@ let plantillasCache = { data: null, ts: 0 };
 const LIMITE_MENSAJERIA_CACHE_MS = 2 * 60 * 1000;
 let limiteMensajeriaCache = { data: null, ts: 0 };
 
-module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
+module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery, notificar = async () => {} }) {
   const router = express.Router();
 
   // ── Escritura contra Supabase (mismo estilo que /api/recordatorios en
@@ -684,6 +684,15 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery }) {
           });
           await actualizarUltimoMensaje(conv.id, cuerpo, "entrante", true);
           console.log(`[whatsapp] Mensaje entrante de ${telefono} (tenant ${tenantId}): "${cuerpo}"`);
+
+          // Aviso al celular (Telegram/ntfy) — se dispara siempre que llega
+          // un mensaje nuevo, se banca solo si faltan las env vars del
+          // módulo de notificaciones (ver notificaciones.js).
+          const cuerpoAviso = cuerpo.length > 300 ? cuerpo.slice(0, 300) + "…" : cuerpo;
+          notificar(
+            `De: ${nombreContacto || telefono}\n${cuerpoAviso}`,
+            "Nuevo WhatsApp"
+          ).catch(() => {});
         }
       }
 

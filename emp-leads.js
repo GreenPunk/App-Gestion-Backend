@@ -18,7 +18,7 @@ const REMITENTE_LEADS = "info@dicio.com.ar";
 // Fase 12 — nombre del estado al que pasa un lead que respondió por mail.
 const ESTADO_RESPUESTA_NOMBRE = "Respuesta de lead contactado por mail";
 
-module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
+module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery, notificar = async () => {} }) {
   const router = express.Router();
 
   async function sbWrite(method, table, body, query = "", prefer = "return=representation") {
@@ -256,6 +256,10 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
               if (lead) {
                 const row = await upsertLead(tenantId, lead);
                 console.log(`[emp-leads] Procesado lead_id_externo=${lead.lead_id_externo} → fila id=${row?.id}`);
+                notificar(
+                  `${lead.nombre || "(sin nombre)"}${lead.telefono ? " - " + lead.telefono : ""}${lead.email ? " - " + lead.email : ""}`,
+                  "Nuevo lead"
+                ).catch(() => {});
               }
             } else if (remitente && remitente !== casilla.toLowerCase()) {
               // Fase 12: ¿es la respuesta de un lead ya cargado para este tenant?
@@ -263,8 +267,13 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery }) {
               if (leadExistente) {
                 await procesarRespuestaLead(tenantId, leadExistente, parsed);
                 console.log(`[emp-leads] Respuesta de mail registrada — lead id=${leadExistente.id} (${remitente})`);
+                notificar(`De: ${remitente}`, "Respuesta de lead por mail").catch(() => {});
+              } else {
+                // No matchea ningún lead conocido — igual se avisa porque
+                // llegó un mail nuevo a la casilla, aunque no se guarde nada.
+                const asunto = parsed.subject || "(sin asunto)";
+                notificar(`De: ${remitente}\nAsunto: ${asunto}`, "Nuevo mail").catch(() => {});
               }
-              // si no matchea ningún lead conocido, se ignora — no es leads-relacionado
             }
           } catch (e) {
             console.error(`[emp-leads] Error procesando uid=${uid}:`, e.message);

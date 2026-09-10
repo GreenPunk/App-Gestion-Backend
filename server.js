@@ -29,6 +29,7 @@ const fs            = require("fs");
 const Anthropic     = require("@anthropic-ai/sdk");
 const crearModuloLeads = require("./emp-leads.js");
 const crearModuloWhatsapp = require("./emp-whatsapp.js");
+const { notificar } = require("./notificaciones.js");
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
@@ -123,14 +124,14 @@ async function sbUpsertService(table, rows, conflictColumn) {
 }
 
 // ── Módulo Leads Emprendimientos ────────────────────────────
-const { router: leadsRouter, iniciarPolling } = crearModuloLeads({ SB_URL, SB_KEY, sbQuery });
+const { router: leadsRouter, iniciarPolling } = crearModuloLeads({ SB_URL, SB_KEY, sbQuery, notificar });
 app.use("/api", leadsRouter);
 iniciarPolling(3); // cada 3 minutos
 
 // ── Módulo WhatsApp Cloud API (envío + webhook de mensajes) ──
 // Mismo patrón que el módulo de leads: factory que recibe las credenciales
 // de Supabase ya armadas acá arriba y devuelve un router para montar.
-const { router: whatsappRouter } = crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery });
+const { router: whatsappRouter } = crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery, notificar });
 app.use("/api/whatsapp", whatsappRouter);
 
 // ── Índice ICL — ARquilerAPI (RapidAPI) ──────────────────────
