@@ -15,6 +15,9 @@
  *    GET  /api/whatsapp/webhook         → verificación del webhook de Meta (WhatsApp Cloud API)
  *    POST /api/whatsapp/webhook         → recibe mensajes entrantes y estados de Meta
  *    POST /api/whatsapp/send            → manda un mensaje de WhatsApp (usado por el módulo de leads)
+ *    POST /api/comparables/buscar       → busca avisos comparables de una zona (Claude + búsqueda web)
+ *    POST /api/comparables/guardar      → guarda una búsqueda de comparables
+ *    GET  /api/comparables/historial    → últimas búsquedas guardadas del tenant
  *    GET  /api/health                   → estado del servidor
  * ─────────────────────────────────────────────────────────────
  */
@@ -29,6 +32,7 @@ const fs            = require("fs");
 const Anthropic     = require("@anthropic-ai/sdk");
 const crearModuloLeads = require("./emp-leads.js");
 const crearModuloWhatsapp = require("./emp-whatsapp.js");
+const crearModuloComparables = require("./comparables.js");
 const { notificar } = require("./notificaciones.js");
 
 const app  = express();
@@ -133,6 +137,12 @@ iniciarPolling(3); // cada 3 minutos
 // de Supabase ya armadas acá arriba y devuelve un router para montar.
 const { router: whatsappRouter } = crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery, notificar });
 app.use("/api/whatsapp", whatsappRouter);
+
+// ── Módulo Comparables de mercado (búsqueda web + USD/m² por zona) ──
+// Mismo patrón que leads y WhatsApp. Usa el cliente `anthropic` de arriba y
+// guarda las búsquedas en comparables_busquedas.
+const { router: comparablesRouter } = crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anthropic });
+app.use("/api/comparables", comparablesRouter);
 
 // ── Índice ICL — ARquilerAPI (RapidAPI) ──────────────────────
 //
