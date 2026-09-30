@@ -8,7 +8,9 @@
  *   POST /api/comparables/buscar        → busca (hasta 20 avisos) o amplía (ampliar + previos). No guarda
  *   POST /api/comparables/geocodificar  → ubica avisos en el mapa (Nominatim / OpenStreetMap)
  *   POST /api/comparables/guardar       → guarda una búsqueda
- *   GET  /api/comparables/historial     → últimas 20 búsquedas del tenant
+ *   GET  /api/comparables/historial     → últimas 100 búsquedas del tenant (con su grupo, si tienen)
+ *   POST /api/comparables/historial/agrupar → pone (o saca) un grupo a una o varias búsquedas guardadas
+ *   POST /api/comparables/historial/borrar  → borra una o varias búsquedas guardadas
  *
  * Mismo patrón que emp-leads.js / emp-whatsapp.js: factory que recibe las
  * credenciales de Supabase ya armadas en server.js y devuelve un router.
@@ -42,7 +44,8 @@ Reglas:
 - Priorizá avisos de la zona indicada y de características parecidas (tipo, superficie, ambientes).
 - Reportá el precio y la moneda tal como figuran en el aviso ("USD" o "ARS").
 - Devolvé hasta ${MAX_AVISOS_POR_BUSQUEDA} avisos distintos. Seguí buscando hasta llegar a ese número o hasta que ya no encuentres avisos nuevos. Priorizá los que publican precio; incluí los que no lo publican solo si hace falta para completar (con precio null).
-- "link": la URL exacta del aviso individual, tal como apareció en los resultados. Nunca la de una página de resultados o de listado, y nunca una URL armada por vos. Si no tenés la del aviso, null.
+- "link": OBLIGATORIO. Cada aviso tiene que traer la URL exacta del aviso individual, tal como apareció en los resultados. Nunca la de una página de resultados o de listado, y nunca una URL armada por vos. Si para un aviso no tenés su URL, intentá encontrarla con otra búsqueda; si igual no la tenés, poné link null y explicá el motivo en "motivo_sin_link" (por ejemplo: "el resultado era un listado" o "el portal no muestra el aviso individual"). Preferí los avisos de los que sí tengas el link.
+- Superficies: abrí la superficie tal como la publica el aviso, cada dato en su campo. "m2_cubiertos": superficie cubierta. "m2_semicubiertos": semicubierta. "m2_descubiertos": descubierta (patio, jardín, terraza descubierta). "m2_balcon": balcón. "m2_terreno": superficie del terreno o lote. "m2_totales": superficie total tal como figura. Usá solo lo que el aviso dice: si un dato no figura, null (no lo calcules por diferencia ni lo estimes). Un 0 explícito del aviso va como 0.
 - "direccion": calle y altura, solo si figuran en el aviso o en su resumen. "barrio": barrio, urbanización o barrio cerrado. "localidad": localidad o partido. Si no figuran, null. No los deduzcas.
 - "hay_mas": true si tenés indicios de que existen más avisos comparables que no incluiste.
 
@@ -60,11 +63,16 @@ Respondé SOLO con un objeto JSON válido, sin texto antes ni después y sin blo
       "moneda": "USD" | "ARS" | null,
       "m2_totales": number | null,
       "m2_cubiertos": number | null,
+      "m2_semicubiertos": number | null,
+      "m2_descubiertos": number | null,
+      "m2_balcon": number | null,
+      "m2_terreno": number | null,
       "ambientes": number | null,
       "antiguedad": string | null,
       "caracteristicas": string[],
       "fuente": string,
-      "link": string | null
+      "link": string | null,
+      "motivo_sin_link": string | null
     }
   ],
   "hay_mas": boolean,
@@ -109,6 +117,12 @@ function aNumero(v) {
   if (typeof v === "number") return Number.isFinite(v) && v > 0 ? v : null;
   const n = Number(String(v).replace(/[^\d.,-]/g, "").replace(/\./g, "").replace(",", "."));
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// Como aNumero, pero conserva un 0 explícito (el aviso dice "0 m² descubiertos")
+function aNumeroOCero(v) {
+  if (v === 0 || (typeof v === "string" && /^\s*0+([.,]0+)?\s*$/.test(v))) return 0;
+  return aNumero(v);
 }
 
 // Texto corto o null
@@ -170,6 +184,25 @@ function recolectarUrls(bloques) {
   return claves;
 }
 
+// Superficie sobre la que se calcula el USD/m², con el mismo método que ModuloTasaciones (supComp):
+//  - terrenos: superficie del terreno (o total)
+//  - resto: cubierta×1 + semicubierta×0.5 + descubierta×0.2 + balcón×0.33
+// base: "terreno" | "homologada" (cubierta + algún dato de la apertura) |
+//       "homologada_parcial" (solo cubierta publicada) | "total" (el aviso no publica cubierta: se usa el total) | null
+function superficieBase({ tipo, m2Tot, m2Cub, m2Sem, m2Des, m2Bal, m2Ter }) {
+  const esTerreno = /lote|terreno/i.test(tipo || "");
+  if (esTerreno) {
+    const m2 = m2Ter || m2Tot;
+    return { m2: m2 || null, base: m2 ? "terreno" : null };
+  }
+  if (m2Cub) {
+    const m2 = m2Cub + (m2Sem || 0) * 0.5 + (m2Des || 0) * 0.2 + (m2Bal || 0) * 0.33;
+    const completa = m2Sem != null || m2Des != null || m2Bal != null;
+    return { m2, base: completa ? "homologada" : "homologada_parcial" };
+  }
+  return { m2: m2Tot || null, base: m2Tot ? "total" : null };
+}
+
 // urlsVistas: Set de claves de links vistos en la búsqueda (o null para no verificar,
 // por ejemplo con avisos que ya vienen de una búsqueda anterior)
 function normalizarAvisos(lista, urlsVistas) {
@@ -188,13 +221,21 @@ function normalizarAvisos(lista, urlsVistas) {
     const moneda = !precio ? null : raw.moneda === "ARS" ? "ARS" : raw.moneda === "USD" ? "USD" : null;
     const m2Tot = aNumero(raw.m2_totales);
     const m2Cub = aNumero(raw.m2_cubiertos);
-    const base = m2Tot || m2Cub;
+    const m2Sem = aNumeroOCero(raw.m2_semicubiertos);
+    const m2Des = aNumeroOCero(raw.m2_descubiertos);
+    const m2Bal = aNumeroOCero(raw.m2_balcon);
+    const m2Ter = aNumero(raw.m2_terreno);
+    const tipoAviso = aTexto(raw.tipo, 60);
+    const sup = superficieBase({ tipo: tipoAviso, m2Tot, m2Cub, m2Sem, m2Des, m2Bal, m2Ter });
+    const base = sup.m2;
 
     const flags = [];
     if (!precio) flags.push("sin_precio");
     else if (!moneda) flags.push("sin_moneda");
     if (moneda === "ARS") flags.push("en_pesos");
     if (!base) flags.push("sin_m2");
+    if (base && sup.base === "homologada_parcial") flags.push("sup_parcial");
+    if (base && sup.base === "total") flags.push("sup_total");
     if (!link) flags.push("sin_link");
     else if (urlsVistas ? urlsVistas.size > 0 && !urlsVistas.has(claveLink(link))
                         : Array.isArray(raw.flags) && raw.flags.includes("link_no_verificado")) {
@@ -208,16 +249,23 @@ function normalizarAvisos(lista, urlsVistas) {
       direccion: aTexto(raw.direccion),
       barrio: aTexto(raw.barrio),
       localidad: aTexto(raw.localidad),
-      tipo: aTexto(raw.tipo, 60),
+      tipo: tipoAviso,
       precio,
       moneda,
       m2_totales: m2Tot,
       m2_cubiertos: m2Cub,
+      m2_semicubiertos: m2Sem,
+      m2_descubiertos: m2Des,
+      m2_balcon: m2Bal,
+      m2_terreno: m2Ter,
+      m2_homologados: base ? Math.round(base * 100) / 100 : null,
+      base_m2: sup.base,
       ambientes: aNumero(raw.ambientes),
       antiguedad: aTexto(raw.antiguedad, 60),
       caracteristicas: Array.isArray(raw.caracteristicas) ? raw.caracteristicas.slice(0, 8).map(c => String(c).slice(0, 60)) : [],
       fuente: String(raw.fuente || "").slice(0, 60),
       link,
+      motivo_sin_link: link ? null : aTexto(raw.motivo_sin_link, 140),
       usd_m2: moneda === "USD" && base ? Math.round(precio / base) : null,
       flags,
       atipico: false,
@@ -411,6 +459,40 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
     return Array.isArray(rows) ? rows[0] : rows;
   }
 
+  async function sbPatch(table, filtro, body) {
+    const res = await fetch(`${SB_URL}/rest/v1/${table}?${filtro}`, {
+      method: "PATCH",
+      headers: {
+        apikey: SB_KEY,
+        Authorization: `Bearer ${SB_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const e = await res.text();
+      throw new Error(`Supabase PATCH ${table} → ${res.status}: ${e}`);
+    }
+    return res.json();
+  }
+
+  async function sbDelete(table, filtro) {
+    const res = await fetch(`${SB_URL}/rest/v1/${table}?${filtro}`, {
+      method: "DELETE",
+      headers: {
+        apikey: SB_KEY,
+        Authorization: `Bearer ${SB_KEY}`,
+        Prefer: "return=representation",
+      },
+    });
+    if (!res.ok) {
+      const e = await res.text();
+      throw new Error(`Supabase DELETE ${table} → ${res.status}: ${e}`);
+    }
+    return res.json();
+  }
+
   async function buscarConClaude(params, previos) {
     let messages = [{ role: "user", content: armarPrompt(params, previos) }];
     const pedir = () => anthropic.messages.create({
@@ -492,7 +574,8 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
 
       const nota = typeof parsed.notas === "string" ? parsed.notas : "";
       const duracion = Date.now() - inicio;
-      console.log(`[comparables] buscar${ampliar ? " (ampliar)" : ""}: ${nuevos.length} avisos nuevos, ${busquedasWeb} búsquedas web, ${duracion} ms`);
+      const sinLink = nuevos.filter(a => !a.link).length;
+      console.log(`[comparables] buscar${ampliar ? " (ampliar)" : ""}: ${nuevos.length} avisos nuevos (${sinLink} sin link), ${busquedasWeb} búsquedas web, ${duracion} ms`);
 
       res.json({
         parametros: params,
@@ -505,6 +588,7 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
         generado: new Date().toISOString(),
         duracion_ms: duracion,
         busquedas_web: busquedasWeb,
+        sin_link: avisos.filter(a => !a.link).length,
       });
     } catch (err) {
       console.error("[comparables] buscar:", err);
@@ -568,12 +652,58 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
       if (!tenant_id || !UUID_RE.test(tenant_id)) return res.status(400).json({ error: "Falta tenant_id" });
       const filas = await sbQuery(
         "comparables_busquedas",
-        `tenant_id=eq.${tenant_id}&select=id,data,created_at&order=created_at.desc&limit=20`
+        `tenant_id=eq.${tenant_id}&select=id,data,created_at&order=created_at.desc&limit=100`
       );
       res.json(filas);
     } catch (err) {
       console.error("[comparables] historial:", err);
       res.status(500).json({ error: "No se pudo leer el historial", detalle: err.message });
+    }
+  });
+
+  // ids de búsquedas guardadas: solo letras, números, guiones y guion bajo (uuid o número)
+  const idsValidos = (ids) =>
+    Array.isArray(ids) && ids.length > 0 && ids.length <= 200 &&
+    ids.every(i => (typeof i === "string" || typeof i === "number") && /^[\w-]{1,64}$/.test(String(i)));
+  const listaIds = (ids) => ids.map(i => encodeURIComponent(String(i))).join(",");
+
+  // Pone (o saca, con grupo vacío) un grupo a una o varias búsquedas guardadas.
+  // El grupo se guarda dentro de data.grupo, sin cambios en la tabla.
+  router.post("/historial/agrupar", async (req, res) => {
+    try {
+      const { tenant_id, ids, grupo } = req.body || {};
+      if (!tenant_id || !UUID_RE.test(tenant_id)) return res.status(400).json({ error: "Falta tenant_id" });
+      if (!idsValidos(ids)) return res.status(400).json({ error: "Faltan las búsquedas a agrupar" });
+      const nombre = aTexto(grupo, 60);
+      const filas = await sbQuery(
+        "comparables_busquedas",
+        `tenant_id=eq.${tenant_id}&id=in.(${listaIds(ids)})&select=id,data`
+      );
+      let cambiadas = 0;
+      for (const f of filas) {
+        const data = { ...(f.data || {}) };
+        if (nombre) data.grupo = nombre; else delete data.grupo;
+        await sbPatch("comparables_busquedas", `id=eq.${encodeURIComponent(String(f.id))}&tenant_id=eq.${tenant_id}`, { data });
+        cambiadas += 1;
+      }
+      res.json({ cambiadas, grupo: nombre });
+    } catch (err) {
+      console.error("[comparables] agrupar:", err);
+      res.status(500).json({ error: "No se pudo agrupar las búsquedas", detalle: err.message });
+    }
+  });
+
+  // Borra una o varias búsquedas guardadas del tenant
+  router.post("/historial/borrar", async (req, res) => {
+    try {
+      const { tenant_id, ids } = req.body || {};
+      if (!tenant_id || !UUID_RE.test(tenant_id)) return res.status(400).json({ error: "Falta tenant_id" });
+      if (!idsValidos(ids)) return res.status(400).json({ error: "Faltan las búsquedas a borrar" });
+      const borradas = await sbDelete("comparables_busquedas", `tenant_id=eq.${tenant_id}&id=in.(${listaIds(ids)})`);
+      res.json({ borradas: Array.isArray(borradas) ? borradas.length : 0 });
+    } catch (err) {
+      console.error("[comparables] borrar:", err);
+      res.status(500).json({ error: "No se pudo borrar las búsquedas", detalle: err.message });
     }
   });
 
@@ -583,6 +713,6 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
 // Solo para tests locales
 module.exports._internals = {
   armarPrompt, parsearJson, aNumero, normalizarAvisos, calcularEstadisticas, percentil,
-  limpiarLink, claveLink, hashCorto, recolectarUrls, precisionDe, candidatosGeo,
+  limpiarLink, claveLink, hashCorto, recolectarUrls, precisionDe, candidatosGeo, superficieBase,
   distanciaKm, coordValida, limpiarDireccion, crearGeocoder,
 };
