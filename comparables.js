@@ -9,6 +9,7 @@
  *   POST /api/comparables/geocodificar  → ubica avisos en el mapa (Nominatim / OpenStreetMap)
  *   POST /api/comparables/guardar       → guarda una búsqueda
  *   GET  /api/comparables/historial     → últimas 100 búsquedas del tenant (con su grupo, si tienen)
+ *   POST /api/comparables/propiedades/actualizar → trae propiedades nuevas y datos faltantes desde Tokko (usa tenants.tokko_key)
  *   POST /api/comparables/historial/agrupar → pone (o saca) un grupo a una o varias búsquedas guardadas
  *   POST /api/comparables/historial/borrar  → borra una o varias búsquedas guardadas
  *
@@ -186,21 +187,21 @@ function recolectarUrls(bloques) {
 
 // Superficie sobre la que se calcula el USD/m², con el mismo método que ModuloTasaciones (supComp):
 //  - terrenos: superficie del terreno (o total)
-//  - resto: cubierta×1 + semicubierta×0.5 + descubierta×0.2 + balcón×0.33
-// base: "terreno" | "homologada" (cubierta + algún dato de la apertura) |
-//       "homologada_parcial" (solo cubierta publicada) | "total" (el aviso no publica cubierta: se usa el total) | null
+//  - resto: SOLO si el aviso publica la superficie cubierta. Se usan todos los datos que traiga:
+//    cubierta×1 + semicubierta×0.5 + descubierta×0.2 + balcón×0.33
+//  - si no publica la cubierta (solo la total, o nada), no se calcula nada: el aviso entra
+//    únicamente en las estadísticas del precio publicado.
+// base: "terreno" | "homologada" (cubierta + algún dato más) | "homologada_parcial" (solo cubierta) | null
 function superficieBase({ tipo, m2Tot, m2Cub, m2Sem, m2Des, m2Bal, m2Ter }) {
   const esTerreno = /lote|terreno/i.test(tipo || "");
   if (esTerreno) {
     const m2 = m2Ter || m2Tot;
     return { m2: m2 || null, base: m2 ? "terreno" : null };
   }
-  if (m2Cub) {
-    const m2 = m2Cub + (m2Sem || 0) * 0.5 + (m2Des || 0) * 0.2 + (m2Bal || 0) * 0.33;
-    const completa = m2Sem != null || m2Des != null || m2Bal != null;
-    return { m2, base: completa ? "homologada" : "homologada_parcial" };
-  }
-  return { m2: m2Tot || null, base: m2Tot ? "total" : null };
+  if (!m2Cub) return { m2: null, base: null };
+  const m2 = m2Cub + (m2Sem || 0) * 0.5 + (m2Des || 0) * 0.2 + (m2Bal || 0) * 0.33;
+  const completa = m2Sem != null || m2Des != null || m2Bal != null;
+  return { m2, base: completa ? "homologada" : "homologada_parcial" };
 }
 
 // urlsVistas: Set de claves de links vistos en la búsqueda (o null para no verificar,
@@ -233,9 +234,9 @@ function normalizarAvisos(lista, urlsVistas) {
     if (!precio) flags.push("sin_precio");
     else if (!moneda) flags.push("sin_moneda");
     if (moneda === "ARS") flags.push("en_pesos");
-    if (!base) flags.push("sin_m2");
+    const esTerrenoAviso = /lote|terreno/i.test(tipoAviso || "");
+    if (!base) flags.push(esTerrenoAviso ? "sin_m2" : "sin_cubierta");
     if (base && sup.base === "homologada_parcial") flags.push("sup_parcial");
-    if (base && sup.base === "total") flags.push("sup_total");
     if (!link) flags.push("sin_link");
     else if (urlsVistas ? urlsVistas.size > 0 && !urlsVistas.has(claveLink(link))
                         : Array.isArray(raw.flags) && raw.flags.includes("link_no_verificado")) {
@@ -284,34 +285,67 @@ function percentil(ordenado, p) {
   return Math.round(ordenado[lo] + (ordenado[hi] - ordenado[lo]) * (idx - lo));
 }
 
+// Medidas de una lista de valores ya ordenada de menor a mayor
+function medidas(vals) {
+  return {
+    mediana: percentil(vals, 0.5),
+    promedio: Math.round(vals.reduce((s, v) => s + v, 0) / vals.length),
+    p25: percentil(vals, 0.25),
+    p75: percentil(vals, 0.75),
+    min: vals[0],
+    max: vals[vals.length - 1],
+  };
+}
+
+// Dos juegos de estadísticas:
+//  - USD/m² (claves *_usd_m2): solo avisos en dólares con superficie calculable (ver superficieBase)
+//  - precio publicado (estadisticas.precio): todos los avisos con precio en dólares, tengan o no superficie
+// Los avisos marcados como atípicos por su USD/m² (muy fuera de la zona) quedan fuera de ambos.
 function calcularEstadisticas(avisos) {
   avisos.forEach(a => { a.atipico = false; });
   const validos = avisos.filter(a => a.usd_m2);
-  if (!validos.length) return null;
 
-  // Atípicos: menos de la mitad o más de 1,8 veces la mediana inicial
-  const inicial = validos.map(a => a.usd_m2).sort((x, y) => x - y);
-  const medIni = percentil(inicial, 0.5);
-  for (const a of validos) a.atipico = a.usd_m2 < medIni * 0.5 || a.usd_m2 > medIni * 1.8;
+  let usados = [];
+  if (validos.length) {
+    // Atípicos: menos de la mitad o más de 1,8 veces la mediana inicial
+    const inicial = validos.map(a => a.usd_m2).sort((x, y) => x - y);
+    const medIni = percentil(inicial, 0.5);
+    for (const a of validos) a.atipico = a.usd_m2 < medIni * 0.5 || a.usd_m2 > medIni * 1.8;
 
-  let usados = validos.filter(a => !a.atipico);
-  if (usados.length < 3) {
-    // Con muy pocos datos no descartamos nada
-    validos.forEach(a => { a.atipico = false; });
-    usados = validos;
+    usados = validos.filter(a => !a.atipico);
+    if (usados.length < 3) {
+      // Con muy pocos datos no descartamos nada
+      validos.forEach(a => { a.atipico = false; });
+      usados = validos;
+    }
   }
 
+  const precios = avisos
+    .filter(a => a.precio && a.moneda === "USD" && !a.atipico)
+    .map(a => a.precio)
+    .sort((x, y) => x - y);
+
+  if (!usados.length && !precios.length) return null;
+
   const vals = usados.map(a => a.usd_m2).sort((x, y) => x - y);
+  const m = vals.length ? medidas(vals) : null;
+  const mp = precios.length ? medidas(precios) : null;
   return {
     cantidad_usada: usados.length,
     cantidad_total: avisos.length,
     excluidos_atipicos: validos.length - usados.length,
-    mediana_usd_m2: percentil(vals, 0.5),
-    promedio_usd_m2: Math.round(vals.reduce((s, v) => s + v, 0) / vals.length),
-    p25_usd_m2: percentil(vals, 0.25),
-    p75_usd_m2: percentil(vals, 0.75),
-    min_usd_m2: vals[0],
-    max_usd_m2: vals[vals.length - 1],
+    mediana_usd_m2: m ? m.mediana : null,
+    promedio_usd_m2: m ? m.promedio : null,
+    p25_usd_m2: m ? m.p25 : null,
+    p75_usd_m2: m ? m.p75 : null,
+    min_usd_m2: m ? m.min : null,
+    max_usd_m2: m ? m.max : null,
+    precio: mp
+      ? {
+          cantidad_usada: precios.length,
+          mediana: mp.mediana, promedio: mp.promedio, p25: mp.p25, p75: mp.p75, min: mp.min, max: mp.max,
+        }
+      : null,
   };
 }
 
@@ -413,6 +447,119 @@ function crearGeocoder() {
   }
 
   return { ubicar };
+}
+
+// ── Tokko (sincronización de propiedades) ────────────────────
+// Misma lógica que ModuloTasaciones (tokkoToProp / importar / reparar), pero del lado del servidor:
+// la apikey sale de tenants.tokko_key y nunca viaja al navegador.
+
+const TOKKO_BASE = "https://www.tokkobroker.com/api/v1";
+const TOKKO_MAX_PAGINAS = 50; // 50 × 20 = 1000 propiedades, igual que Tasaciones
+const MAX_SYNC_POR_HORA = Number(process.env.COMPARABLES_TOKKO_POR_HORA || 6);
+const QUAL_VARS = ["Ubicación", "Vistas", "Calidad constructiva", "Distribución", "Estacionamiento", "Mantenimiento", "Equipamiento"];
+const defQuals = () => Object.fromEntries(QUAL_VARS.map(v => [v, "Equivalente"]));
+
+// Campos técnicos que se completan desde Tokko solo si en la propiedad están vacíos o en "0".
+// Nunca se pisa lo que alguien editó a mano. El precio tampoco se toca en propiedades existentes.
+const TOKKO_CAMPOS_TECNICOS = [
+  "supCubierta", "supSemicubierta", "supDescubierta", "supBalcon", "supTotal",
+  "dormitorios", "banos", "estacionamiento", "antiguedad",
+  "orientacion", "condicion", "disposicion", "ambientes",
+  "_tokkoUrl", "_tokkoRef", "_ciudad",
+];
+
+function tokkoToProp(t) {
+  const round = v => {
+    const n = parseFloat(v);
+    return (!isNaN(n) && n > 0) ? String(Math.round(n)) : "";
+  };
+  const supCubierta = round(t.roofed_surface);
+  const supSemicubierta = round(t.semiroofed_surface);
+  const supDescubierta = round(t.unroofed_surface);
+  const supBalcon = ""; // Tokko no publica m² de balcón
+  const supTotal = round(t.surface) || round(t.total_surface) || supCubierta;
+
+  const address = t.address || t.fake_address || "";
+  const ciudad = t.location?.name || "";
+  const fullLoc = t.location?.full_location || "";
+  const barrio = ciudad || (fullLoc ? fullLoc.split("|").pop().trim() : "");
+
+  const tipoMap = {
+    "Departamento": "Departamento", "Casa": "Casa", "PH": "PH",
+    "Local Comercial": "Local", "Oficina": "Oficina", "Terreno": "Terreno",
+    "Duplex": "PH", "Triplex": "PH", "Loft": "Departamento",
+    "Casa de campo": "Casa", "Finca": "Casa", "Quinta": "Casa",
+    "Chalet": "Casa", "Villa": "Casa",
+  };
+  const tipo = tipoMap[t.type?.name] || t.type?.name || "Departamento";
+  const precio = t.operations?.[0]?.prices?.[0]?.price || 0;
+  const antiguedad = (t.age === 0 || t.age === "0") ? "0" : t.age ? String(t.age) : "";
+  const dormitorios = t.suite_amount != null ? String(t.suite_amount) : "";
+  const ambientes = t.room_amount ? String(t.room_amount) : "";
+  const desc = (t.description || t.description_only || "")
+    .replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 400);
+
+  const missingFields = [];
+  if (!supCubierta && !supTotal) missingFields.push("superficies");
+  if (!precio) missingFields.push("precio");
+  if (!dormitorios) missingFields.push("dormitorios");
+
+  return {
+    id: Date.now() + Math.random(),
+    direccion: address,
+    barrio,
+    tipologia: tipo,
+    precio: precio ? String(Math.round(precio)) : "",
+    supCubierta, supSemicubierta, supDescubierta, supBalcon, supTotal,
+    antiguedad, dormitorios, ambientes,
+    banos: t.bathroom_amount ? String(t.bathroom_amount) : "",
+    estacionamiento: t.parking_lot_amount ? String(t.parking_lot_amount) : "",
+    orientacion: t.orientation || "",
+    condicion: t.property_condition || "",
+    disposicion: t.disposition || "",
+    comentarios: desc,
+    qualifications: defQuals(),
+    agentId: null,
+    fecha: new Date().toISOString().slice(0, 10),
+    tipo: "base",
+    _tokkoId: String(t.id),
+    _tokkoUrl: t.public_url || "",
+    _tokkoRef: t.reference_code || "",
+    _ciudad: ciudad,
+    _lat: t.geo_lat ? parseFloat(t.geo_lat) : null,
+    _lng: t.geo_long ? parseFloat(t.geo_long) : null,
+    _missingFields: missingFields.length ? missingFields : null,
+  };
+}
+
+// Campos que conviene completar en una propiedad que ya existe (vacío o "0" → valor de Tokko)
+function parcheTokko(existente, fresca) {
+  const patch = {};
+  for (const campo of TOKKO_CAMPOS_TECNICOS) {
+    const cur = existente[campo];
+    const nxt = fresca[campo];
+    const vacio = !cur || cur === "0";
+    if (vacio && nxt && nxt !== "0") patch[campo] = nxt;
+  }
+  if ((!existente._lat || !existente._lng) && fresca._lat && fresca._lng) {
+    patch._lat = fresca._lat;
+    patch._lng = fresca._lng;
+  }
+  return patch;
+}
+
+// Una página de propiedades de Tokko. Los errores no incluyen la URL (lleva la apikey).
+async function tokkoPagina(key, offset) {
+  const params = new URLSearchParams({ key, format: "json", lang: "es_ar", limit: "20", offset: String(offset) });
+  let res;
+  try {
+    res = await fetch(`${TOKKO_BASE}/property/?${params}`, { signal: AbortSignal.timeout(20000) });
+  } catch (e) {
+    throw new Error(e?.name === "TimeoutError" ? "Tokko tardó demasiado en responder" : "No se pudo conectar con Tokko");
+  }
+  if (res.status === 401 || res.status === 403) throw new Error("Tokko rechazó la apikey (revisá la del tenant)");
+  if (!res.ok) throw new Error(`Tokko respondió con error ${res.status}`);
+  return res.json();
 }
 
 // ── Módulo ───────────────────────────────────────────────────
@@ -661,6 +808,74 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
     }
   });
 
+  // Trae de Tokko las propiedades que faltan y completa datos vacíos de las que ya están.
+  // No borra nada, no pisa lo editado a mano y no cambia el precio de las existentes.
+  const excedeLimiteSync = crearLimite(MAX_SYNC_POR_HORA);
+  router.post("/propiedades/actualizar", async (req, res) => {
+    const inicio = Date.now();
+    try {
+      const { tenant_id } = req.body || {};
+      if (!tenant_id || !UUID_RE.test(tenant_id)) return res.status(400).json({ error: "Falta tenant_id" });
+      if (excedeLimiteSync(tenant_id)) {
+        return res.status(429).json({ error: `Ya actualizaste ${MAX_SYNC_POR_HORA} veces en la última hora. Probá más tarde.` });
+      }
+
+      const tenants = await sbQuery("tenants", `id=eq.${tenant_id}&select=tokko_key`);
+      const key = String(tenants?.[0]?.tokko_key || "").trim();
+      if (!key) return res.status(400).json({ error: "Este tenant no tiene cargada la apikey de Tokko." });
+
+      const filas = await sbQuery("properties", `tenant_id=eq.${tenant_id}&select=id,data&limit=2000`);
+      const porTokko = new Map();
+      for (const f of filas) {
+        const tid = f?.data?._tokkoId;
+        if (tid != null && tid !== "") porTokko.set(String(tid), f);
+      }
+
+      let nuevas = 0, actualizadas = 0, sinCambios = 0, errores = 0, totalTokko = 0;
+      let offset = 0;
+      for (let pagina = 0; pagina < TOKKO_MAX_PAGINAS; pagina++) {
+        const data = await tokkoPagina(key, offset);
+        const objetos = Array.isArray(data?.objects) ? data.objects : [];
+        totalTokko += objetos.length;
+
+        for (const t of objetos) {
+          if (t?.id == null) continue;
+          const clave = String(t.id);
+          try {
+            const fresca = tokkoToProp(t);
+            const existente = porTokko.get(clave);
+            if (existente) {
+              const patch = existente.yaVisto ? {} : parcheTokko(existente.data || {}, fresca);
+              existente.yaVisto = true;
+              if (!Object.keys(patch).length) { sinCambios++; continue; }
+              const dataNueva = { ...(existente.data || {}), ...patch };
+              await sbPatch("properties", `id=eq.${encodeURIComponent(String(existente.id))}&tenant_id=eq.${tenant_id}`, { data: dataNueva });
+              existente.data = dataNueva;
+              actualizadas++;
+            } else {
+              const fila = await sbInsert("properties", { tenant_id, data: fresca });
+              porTokko.set(clave, { id: fila.id, data: fila.data || fresca, yaVisto: true });
+              nuevas++;
+            }
+          } catch (e) {
+            errores++;
+            console.error("[comparables] tokko propiedad:", e.message);
+          }
+        }
+
+        if (!data?.meta?.next || !objetos.length) break;
+        offset += 20;
+      }
+
+      const duracion = Date.now() - inicio;
+      console.log(`[comparables] tokko: ${totalTokko} en Tokko, ${nuevas} nuevas, ${actualizadas} actualizadas, ${sinCambios} sin cambios, ${errores} errores, ${duracion} ms`);
+      res.json({ total_tokko: totalTokko, nuevas, actualizadas, sin_cambios: sinCambios, errores, duracion_ms: duracion });
+    } catch (err) {
+      console.error("[comparables] tokko:", err.message);
+      res.status(502).json({ error: err.message || "No se pudo actualizar desde Tokko" });
+    }
+  });
+
   // ids de búsquedas guardadas: solo letras, números, guiones y guion bajo (uuid o número)
   const idsValidos = (ids) =>
     Array.isArray(ids) && ids.length > 0 && ids.length <= 200 &&
@@ -715,4 +930,5 @@ module.exports._internals = {
   armarPrompt, parsearJson, aNumero, normalizarAvisos, calcularEstadisticas, percentil,
   limpiarLink, claveLink, hashCorto, recolectarUrls, precisionDe, candidatosGeo, superficieBase,
   distanciaKm, coordValida, limpiarDireccion, crearGeocoder,
+  tokkoToProp, parcheTokko, medidas,
 };
