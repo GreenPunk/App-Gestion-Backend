@@ -294,6 +294,7 @@ function normalizarAvisos(lista, urlsVistas) {
       link,
       motivo_sin_link: link ? null : aTexto(raw.motivo_sin_link, 140),
       // Lo que agrega el servidor al verificar el link (ver verificarAvisos). Se conserva al ampliar y al guardar.
+      ...(Array.isArray(raw.datos_pagina) && raw.datos_pagina.length ? { datos_pagina: raw.datos_pagina.slice(0, 10).map(x => String(x).slice(0, 20)) } : {}),
       ...(raw.verificacion && typeof raw.verificacion.estado === "string"
         ? { verificacion: { estado: raw.verificacion.estado.slice(0, 20), motivo: aTexto(raw.verificacion.motivo, 200) } }
         : {}),
@@ -660,7 +661,7 @@ const enArgentina = (lat, lng) => lat >= ARG_LAT[0] && lat <= ARG_LAT[1] && lng 
 
 // Coordenadas, dirección y precio que la propia página declara
 function extraerDePagina(html) {
-  const out = { lat: null, lng: null, direccion: null, localidad: null, precio: null, origen: null, conAltura: false };
+  const out = { lat: null, lng: null, direccion: null, localidad: null, precio: null, moneda: null, titulo: null, m2_totales: null, ambientes: null, origen: null, conAltura: false };
   const h = String(html || "");
   const aNum = v => { const n = Number(String(v).replace(",", ".")); return Number.isFinite(n) ? n : null; };
   const fijar = (lat, lng, origen) => {
@@ -678,7 +679,14 @@ function extraerDePagina(html) {
       if (nodo.address.streetAddress && !out.direccion) out.direccion = aTexto(nodo.address.streetAddress, 120);
       if (nodo.address.addressLocality && !out.localidad) out.localidad = aTexto(nodo.address.addressLocality, 80);
     }
-    if (nodo.price != null && out.precio == null) out.precio = aNum(nodo.price);
+    if (nodo.price != null && out.precio == null) {
+      out.precio = aNum(nodo.price);
+      const mon = String(nodo.priceCurrency || "").toUpperCase();
+      if (mon === "USD" || mon === "ARS") out.moneda = mon;
+    }
+    if (nodo.floorSize && typeof nodo.floorSize === "object" && out.m2_totales == null) out.m2_totales = aNum(nodo.floorSize.value);
+    if (nodo.numberOfRooms != null && out.ambientes == null) out.ambientes = aNum(nodo.numberOfRooms);
+    if (nodo.name && !out.titulo && /house|apartment|residence|product|realestate|accommodation/i.test(String(nodo["@type"] || ""))) out.titulo = aTexto(nodo.name, 200);
     for (const k of Object.keys(nodo)) if (typeof nodo[k] === "object") recorrer(nodo[k], prof + 1);
   };
   for (const m of h.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
@@ -716,6 +724,40 @@ function extraerDePagina(html) {
   return out;
 }
 
+// "85,5" → 85.5; "1.250" → 1250
+function aM2(tok) {
+  const t = String(tok).trim();
+  const n = /^\d{1,3}(?:\.\d{3})+(?:,\d+)?$/.test(t) ? Number(t.replace(/\./g, "").replace(",", ".")) : Number(t.replace(",", "."));
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+// Superficies que la página muestra con su rótulo ("Superficie cubierta: 150 m²", "150 m² cubiertos").
+// Solo se toma un dato si el rótulo es claro; la primera aparición es la del aviso (después suelen venir los relacionados).
+function superficiesDeTexto(texto) {
+  const t = sinTildes(texto);
+  const N = "(\\d{1,3}(?:\\.\\d{3})+(?:,\\d+)?|\\d+(?:[.,]\\d+)?)";
+  const U = "\\s*(?:m2|m²|mts2|mts|metros)";
+  const rot = {
+    m2_cubiertos: "(?<!semi)(?<!semi )cubiert[ao]s?",
+    m2_semicubiertos: "semi\\s?cubiert[ao]s?",
+    m2_descubiertos: "descubiert[ao]s?",
+    m2_balcon: "balcon(?:es)?",
+    m2_terreno: "(?:terreno|lote)",
+    m2_totales: "(?:total|totales)",
+  };
+  const out = {};
+  for (const [campo, r] of Object.entries(rot)) {
+    const delante = new RegExp(`(?:sup(?:erficie)?\\.?\\s*)?${r}\\s*[:\\-]?\\s*${N}${U}`, "i");
+    const detras = new RegExp(`${N}${U}\\s*(?:de\\s*)?${r}`, "i");
+    const m = t.match(delante) || t.match(detras);
+    if (m) {
+      const v = aM2(m[1]);
+      if (v != null && v < 100000) out[campo] = v;
+    }
+  }
+  return out;
+}
+
 const MOTIVOS_ERROR = {
   host_no_permitido: "el link apunta a una dirección que no se puede consultar",
   timeout: "el portal tardó demasiado en responder",
@@ -743,8 +785,12 @@ async function verificarAviso(a) {
 
   const ev = evaluarDatos(a, texto, numerosDe(texto));
   const aciertos = [ev.sup, ev.dir, ev.barrio].filter(x => x === true).length;
-  const ok = a.precio ? ev.precio === true && aciertos >= 1 : aciertos >= 2;
   const pagina = extraerDePagina(r.html);
+  pagina.superficies = superficiesDeTexto(texto);
+  // Si la página declara su precio de forma estructurada (JSON-LD) y no es un listado, el aviso existe y sus datos
+  // salen de ahí, aunque el modelo los haya leído distinto.
+  const precioEstructurado = pagina.precio > 0 && (pagina.moneda === "USD" || pagina.moneda === "ARS");
+  const ok = precioEstructurado || (a.precio ? ev.precio === true && aciertos >= 1 : aciertos >= 2);
   if (!ok) {
     const motivo = a.precio && ev.precio !== true
       ? `el precio publicado (${fmtPrecio(a)}) no se ve en la página del link`
@@ -772,21 +818,37 @@ async function verificarAvisos(avisos) {
   return res;
 }
 
-// Guarda en el aviso el resultado de la verificación y, si la página trae coordenadas, las usa para el mapa
+// Guarda en el aviso el resultado de la verificación. Si el aviso se verificó, los datos que la propia página
+// muestra (precio, superficies, ubicación) reemplazan a los del modelo y se recalcula el USD/m².
+// Devuelve el aviso (nuevo, ya recalculado).
 function aplicarVerificacion(a, v) {
-  a.verificacion = { estado: v.estado, motivo: v.motivo || null };
   const pg = v.pagina;
+  const nuevo = { ...a, verificacion: { estado: v.estado, motivo: v.motivo || null } };
+  const dePagina = [];
   if (v.estado === "verificado" && pg) {
-    if (pg.lat != null && pg.lng != null) {
-      a.lat = pg.lat; a.lng = pg.lng;
-      a.ubic_precision = pg.conAltura ? "exacta" : "calle";
-      a.ubic_origen = "pagina";
+    if (pg.precio > 0 && (pg.moneda === "USD" || pg.moneda === "ARS")) {
+      if (nuevo.precio !== pg.precio || nuevo.moneda !== pg.moneda) dePagina.push("precio");
+      nuevo.precio = pg.precio;
+      nuevo.moneda = pg.moneda;
     }
-    if (!a.direccion && pg.direccion) a.direccion = pg.direccion;
-    if (!a.localidad && pg.localidad) a.localidad = pg.localidad;
+    const sup = { ...(pg.m2_totales ? { m2_totales: pg.m2_totales } : {}), ...(pg.superficies || {}) };
+    for (const [campo, valor] of Object.entries(sup)) {
+      if (valor != null && nuevo[campo] !== valor) { nuevo[campo] = valor; dePagina.push(campo); }
+    }
+    if (!nuevo.ambientes && pg.ambientes) nuevo.ambientes = pg.ambientes;
+    if (pg.titulo) nuevo.titulo = pg.titulo;
+    if (pg.lat != null && pg.lng != null) {
+      nuevo.lat = pg.lat; nuevo.lng = pg.lng;
+      nuevo.ubic_precision = pg.conAltura ? "exacta" : "calle";
+      nuevo.ubic_origen = "pagina";
+    }
+    if (!nuevo.direccion && pg.direccion) nuevo.direccion = pg.direccion;
+    if (!nuevo.localidad && pg.localidad) nuevo.localidad = pg.localidad;
   }
-  if (v.estado !== "verificado" && !a.flags.includes("no_verificado")) a.flags.push("no_verificado");
-  return a;
+  if (dePagina.length) nuevo.datos_pagina = dePagina;
+  // Se vuelve a normalizar para recalcular superficie homologada, USD/m² y advertencias con los datos finales
+  const [rec] = normalizarAvisos([nuevo], null);
+  return rec || nuevo;
 }
 
 // ── Tokko (sincronización de propiedades) ────────────────────
@@ -1112,10 +1174,14 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
       let descartados = [];
       if (VERIFICAR_MODO !== "off" && candidatos.length) {
         const vers = await verificarAvisos(candidatos);
-        candidatos.forEach((a, k) => aplicarVerificacion(a, vers[k]));
+        const conVerif = candidatos.map((a, k) => aplicarVerificacion(a, vers[k]));
+        // Con los datos de la página puede haber duplicados nuevos (mismo precio y dirección)
+        const sinDup = quitarDuplicados(conVerif, previosN);
         if (VERIFICAR_MODO === "estricto") {
-          descartados = candidatos.filter(a => a.verificacion.estado !== "verificado");
-          nuevos = candidatos.filter(a => a.verificacion.estado === "verificado");
+          descartados = sinDup.filter(a => a.verificacion.estado !== "verificado");
+          nuevos = sinDup.filter(a => a.verificacion.estado === "verificado");
+        } else {
+          nuevos = sinDup;
         }
       }
       const avisos = [...previosN, ...nuevos];
@@ -1359,6 +1425,6 @@ module.exports._internals = {
   limpiarLink, claveLink, hashCorto, recolectarUrls, precisionDe, candidatosGeo, superficieBase,
   distanciaKm, coordValida, limpiarDireccion, crearGeocoder,
   tokkoToProp, parcheTokko, medidas,
-  htmlATexto, numerosDe, pareceListado, evaluarDatos, extraerDePagina, verificarAviso, verificarAvisos, aplicarVerificacion,
+  htmlATexto, numerosDe, pareceListado, evaluarDatos, extraerDePagina, superficiesDeTexto, verificarAviso, verificarAvisos, aplicarVerificacion,
   quitarDuplicados, limpiarSalidaModelo, esIpPrivada, hostSeguro, costoEstimado, preciosDeModelo,
 };
