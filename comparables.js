@@ -5,7 +5,8 @@
  * USD/m², ubica los avisos en el mapa y guarda las búsquedas en
  * Supabase (comparables_busquedas).
  *
- *   POST /api/comparables/buscar        → busca (hasta 20 avisos) o amplía (ampliar + previos). No guarda
+ *   POST /api/comparables/buscar        → busca (hasta 15 avisos) o amplía (ampliar + previos). No guarda.
+ *                                         Solo muestra avisos con link real (que la búsqueda devolvió) y con los datos de su propia página
  *   POST /api/comparables/geocodificar  → ubica avisos en el mapa (Nominatim / OpenStreetMap)
  *   POST /api/comparables/guardar       → guarda una búsqueda
  *   GET  /api/comparables/historial     → últimas 100 búsquedas del tenant (con su grupo, si tienen)
@@ -56,13 +57,20 @@ function costoEstimado(uso, modelo) {
 
 // Verificación de links: antes de mostrar un aviso se abre su link y se comprueba que la página sea el aviso
 // y que sus datos (precio, superficie, dirección) se vean ahí.
-//   estricto (por defecto): solo quedan los avisos verificados; el resto se descarta y se informa por qué
-//   marcar: quedan todos, pero los no verificados no entran en las estadísticas
+//   marcar (por defecto): quedan los avisos cuyo link existe pero no se pudo leer, marcados como "sin verificar"
+//     y fuera de las estadísticas
+//   estricto: solo quedan los avisos verificados; el resto se descarta y se informa por qué
 //   off: no se verifica
+// En cualquier modo, un aviso cuyo link NO aparece en los resultados de la búsqueda web (lo armó el modelo) o que no
+// trae link se descarta siempre: nunca se muestra un dato sin un link real detrás.
 const VERIFICAR_MODO = ["estricto", "marcar", "off"].includes(process.env.COMPARABLES_VERIFICAR_LINKS)
-  ? process.env.COMPARABLES_VERIFICAR_LINKS : "estricto";
+  ? process.env.COMPARABLES_VERIFICAR_LINKS : "marcar";
 const VERIF_TIMEOUT_MS = Number(process.env.COMPARABLES_VERIF_TIMEOUT_MS || 9000);
-const VERIF_PRESUPUESTO_MS = Number(process.env.COMPARABLES_VERIF_PRESUPUESTO_MS || 40000);
+const VERIF_PRESUPUESTO_MS = Number(process.env.COMPARABLES_VERIF_PRESUPUESTO_MS || 35000);
+// Avisos que el servidor lee por su cuenta (de los listados que devolvió la búsqueda), además de los del modelo
+const MAX_CANDIDATOS = Number(process.env.COMPARABLES_MAX_CANDIDATOS || 24);
+const MAX_LISTADOS_A_LEER = 4;
+const MAX_LINKS_POR_LISTADO = 10;
 const VERIF_CONCURRENCIA = 6;
 const VERIF_MAX_BYTES = 1500000;
 const VERIF_UA = process.env.COMPARABLES_VERIF_UA || "Mozilla/5.0 (compatible; GestionInmobiliaria-Comparables/1.0; uso interno)";
@@ -79,10 +87,10 @@ const SYSTEM_PROMPT = `Sos un analista inmobiliario de Argentina. Buscá en la w
 
 Reglas:
 - Buscá en portales argentinos (Zonaprop, Argenprop, MercadoLibre Inmuebles, sitios de inmobiliarias de la zona).
-- Usá solo avisos que hayas visto realmente en los resultados. Nunca inventes avisos, precios, direcciones ni links. Si un dato no figura, poné null: no lo estimes.
+- Usá solo avisos que hayas visto realmente en los resultados. Nunca inventes avisos, precios, direcciones ni links. Si un dato no figura, poné null: no lo estimes. Copiá cada dato tal cual figura en el aviso, sin combinar datos de avisos distintos y sin completar los que faltan.
 - Priorizá avisos de la zona indicada y de características parecidas (tipo, superficie, ambientes).
 - Precio y moneda tal como figuran ("USD" o "ARS").
-- "link": la URL exacta del aviso individual, tal como apareció en los resultados. Incluí SOLO avisos de los que tengas esa URL. Nunca la de una página de resultados o de listado, y nunca una URL armada por vos. Si no tenés el link individual, no incluyas el aviso. Cada link se va a abrir para comprobar que muestre los datos que informás.
+- "link": la URL exacta del aviso individual, copiada de los resultados de la búsqueda. El servidor DESCARTA todo aviso cuyo link no figure literalmente en esos resultados. Nunca armes una URL a partir del título, de la inmobiliaria o de un patrón. Si el resultado es una página de listado que no muestra el link de cada aviso, no incluyas esos avisos: el servidor lee los listados por su cuenta. Cada link se va a abrir para comprobar que muestre los datos que informás. Es preferible devolver pocos avisos o ninguno antes que uno con un link o un dato dudoso.
 - No repitas el mismo inmueble publicado en distintos portales o inmobiliarias (misma dirección y mismo precio): incluilo una sola vez.
 - Devolvé hasta ${MAX_AVISOS_POR_BUSQUEDA} avisos distintos y dejá de buscar cuando los tengas o cuando no aparezcan avisos nuevos. Priorizá los que publican precio.
 - Superficies, cada dato en su campo y solo si el aviso lo dice (un 0 explícito va como 0; si no figura, null; no calcules por diferencia): "m2_cubiertos", "m2_semicubiertos", "m2_descubiertos" (patio, jardín, terraza descubierta), "m2_balcon", "m2_terreno", "m2_totales".
@@ -198,6 +206,49 @@ function recolectarUrls(bloques) {
   return claves;
 }
 
+// Resultados que la búsqueda web devolvió de verdad: [{ url, titulo }]
+function recolectarResultados(bloques) {
+  const vistos = new Set();
+  const out = [];
+  for (const b of bloques || []) {
+    if (b?.type === "web_search_tool_result" && Array.isArray(b.content)) {
+      for (const r of b.content) {
+        const url = limpiarLink(r?.url);
+        const k = url && claveLink(url);
+        if (k && !vistos.has(k)) { vistos.add(k); out.push({ url, titulo: aTexto(r?.title, 160) }); }
+      }
+    }
+  }
+  return out;
+}
+
+// ¿La URL parece la de un aviso individual? Los portales ponen el código del aviso en la ruta (6 dígitos o más)
+function pareceUrlDeAviso(url) {
+  try {
+    const ruta = new URL(url).pathname.toLowerCase();
+    if (ruta.replace(/\//g, "") === "") return false;
+    if (/\.(jpe?g|png|webp|gif|svg|pdf|css|js)$/.test(ruta)) return false;
+    return /\d{6,}/.test(ruta);
+  } catch {
+    return false;
+  }
+}
+
+// Nombre del portal según el dominio del link (no lo decide el modelo)
+function fuenteDeLink(link) {
+  try {
+    const h = new URL(link).hostname.replace(/^www\./, "").toLowerCase();
+    if (h.includes("argenprop")) return "Argenprop";
+    if (h.includes("zonaprop")) return "Zonaprop";
+    if (h.includes("mercadolibre")) return "MercadoLibre";
+    if (h.includes("remax")) return "REMAX";
+    if (h.includes("properati")) return "Properati";
+    return h;
+  } catch {
+    return null;
+  }
+}
+
 // Superficie sobre la que se calcula el USD/m², con el mismo método que ModuloTasaciones (supComp):
 //  - terrenos: superficie del terreno (o total)
 //  - resto: SOLO si el aviso publica la superficie cubierta. Se usan todos los datos que traiga:
@@ -295,6 +346,12 @@ function normalizarAvisos(lista, urlsVistas) {
       motivo_sin_link: link ? null : aTexto(raw.motivo_sin_link, 140),
       // Lo que agrega el servidor al verificar el link (ver verificarAvisos). Se conserva al ampliar y al guardar.
       ...(Array.isArray(raw.datos_pagina) && raw.datos_pagina.length ? { datos_pagina: raw.datos_pagina.slice(0, 10).map(x => String(x).slice(0, 20)) } : {}),
+      // Aviso que el servidor encontró en un listado y leyó de su propia página (el modelo no escribió nada)
+      ...(raw.solo_pagina ? { solo_pagina: true } : {}),
+      // Lo que la página dice textualmente, para comparar a ojo: [{ campo, texto }]
+      ...(Array.isArray(raw.evidencia) && raw.evidencia.length
+        ? { evidencia: raw.evidencia.slice(0, 10).map(e => ({ campo: String(e?.campo || "").slice(0, 20), texto: String(e?.texto || "").slice(0, 90) })).filter(e => e.campo && e.texto) }
+        : {}),
       ...(raw.verificacion && typeof raw.verificacion.estado === "string"
         ? { verificacion: { estado: raw.verificacion.estado.slice(0, 20), motivo: aTexto(raw.verificacion.motivo, 200) } }
         : {}),
@@ -322,6 +379,8 @@ function quitarDuplicados(avisos, previos = []) {
     return true;
   });
 }
+
+const normalizarAvisosCantidad = lista => (Array.isArray(lista) ? lista.length : 0);
 
 // ── Estadísticas ─────────────────────────────────────────────
 
@@ -661,7 +720,7 @@ const enArgentina = (lat, lng) => lat >= ARG_LAT[0] && lat <= ARG_LAT[1] && lng 
 
 // Coordenadas, dirección y precio que la propia página declara
 function extraerDePagina(html) {
-  const out = { lat: null, lng: null, direccion: null, localidad: null, precio: null, moneda: null, titulo: null, m2_totales: null, ambientes: null, origen: null, conAltura: false };
+  const out = { lat: null, lng: null, direccion: null, localidad: null, precio: null, moneda: null, titulo: null, tituloMeta: null, m2_totales: null, ambientes: null, origen: null, conAltura: false };
   const h = String(html || "");
   const aNum = v => { const n = Number(String(v).replace(",", ".")); return Number.isFinite(n) ? n : null; };
   const fijar = (lat, lng, origen) => {
@@ -721,6 +780,21 @@ function extraerDePagina(html) {
     }
   }
   out.conAltura = !!(out.direccion && /\d/.test(out.direccion));
+
+  // Título de la página (og:title o <title>), sin el nombre del sitio al final
+  let tm = null;
+  for (const m of h.matchAll(/<meta\b[^>]*>/gi)) {
+    if (/property\s*=\s*["']og:title["']/i.test(m[0])) {
+      const c = m[0].match(/content\s*=\s*["']([^"']*)["']/i);
+      if (c) { tm = c[1]; break; }
+    }
+  }
+  if (!tm) { const t = h.match(/<title[^>]*>([\s\S]*?)<\/title>/i); if (t) tm = t[1]; }
+  if (tm) {
+    const completo = decodificar(tm).replace(/\s+/g, " ").trim();
+    const corto = completo.replace(/\s+[|–—]\s+[^|–—]{1,30}$/, "").replace(/\s+-\s+[^-]{1,24}$/, "").trim();
+    out.tituloMeta = aTexto(corto.length >= 8 ? corto : completo, 200);
+  }
   return out;
 }
 
@@ -767,11 +841,208 @@ const MOTIVOS_ERROR = {
   no_html: "el link no lleva a una página web",
 };
 
-async function verificarAviso(a) {
+// Lee una página una sola vez por búsqueda (verificar avisos y expandir listados usan la misma lectura)
+function leerPaginaUnaVez(url, cache) {
+  const k = claveLink(url) || url;
+  if (!cache.has(k)) cache.set(k, bajarPagina(url).catch(() => ({ error: "conexion" })));
+  return cache.get(k);
+}
+
+// Algunos portales devuelven la portada (o una página genérica) para cualquier ruta, o arman el aviso con
+// JavaScript: el servidor no ve el aviso. Se detecta porque la URL canónica de la página es la raíz del sitio.
+function esPortadaDisfrazada(urlFinal, html) {
+  let ruta;
+  try { ruta = new URL(urlFinal).pathname.replace(/\/+$/, ""); } catch { return null; }
+  if (ruta === "") return null; // la portada real ya la detecta pareceListado
+  const h = String(html || "");
+  let canonica = null;
+  for (const m of h.matchAll(/<link\b[^>]*>/gi)) {
+    if (/rel\s*=\s*["']?canonical/i.test(m[0])) {
+      const href = m[0].match(/href\s*=\s*["']([^"']+)["']/i);
+      if (href) { canonica = href[1]; break; }
+    }
+  }
+  if (!canonica) {
+    for (const m of h.matchAll(/<meta\b[^>]*>/gi)) {
+      if (/property\s*=\s*["']og:url["']/i.test(m[0])) {
+        const c = m[0].match(/content\s*=\s*["']([^"']+)["']/i);
+        if (c) { canonica = c[1]; break; }
+      }
+    }
+  }
+  if (!canonica) return null;
+  try {
+    if (new URL(canonica, urlFinal).pathname.replace(/\/+$/, "") === "") {
+      return "la página que abre el link es la portada del sitio, no el aviso (el aviso no existe, se dio de baja o el portal lo arma con JavaScript)";
+    }
+  } catch { /* canónica inválida: se ignora */ }
+  return null;
+}
+
+// Las distintas lecturas numéricas de un token ("250.000" → 250000; "85,5" → 85.5)
+function lecturasDe(tok) {
+  const out = [];
+  const entero = Number(tok.replace(/[.,\u00a0]/g, ""));
+  if (Number.isFinite(entero)) out.push(entero);
+  const dec = tok.match(/^(\d{1,3}(?:[.,\u00a0]\d{3})*|\d+)[.,](\d{1,2})$/);
+  if (dec) {
+    const v = Number(dec[1].replace(/[.,\u00a0]/g, "") + "." + dec[2]);
+    if (Number.isFinite(v)) out.push(v);
+  }
+  return out;
+}
+
+// Busca en el texto de la página un número y devuelve el fragmento textual donde aparece (o null).
+//  moneda: el número tiene que ir junto a USD / U$S (o $) · unidad: seguido de m² · redondeo: acepta 85,5 por 86
+function buscarNumero(texto, valor, { moneda = null, unidad = false, redondeo = false } = {}) {
+  const re = /\d{1,3}(?:[.,\u00a0]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d+)?/g;
+  let m;
+  while ((m = re.exec(texto))) {
+    const tok = m[0];
+    const coincide = lecturasDe(tok).some(v => redondeo ? Math.round(v) === Math.round(valor) : v === valor);
+    if (!coincide) continue;
+    const antes = texto.slice(Math.max(0, m.index - 10), m.index);
+    const despues = texto.slice(m.index + tok.length, m.index + tok.length + 12);
+    if (moneda === "USD" && !(/(?:USD|U\$S|US\$|d[oó]lares?)\s*$/i.test(antes) || /^\s*(?:USD|U\$S|US\$|d[oó]lares?)/i.test(despues))) continue;
+    if (moneda === "ARS" && !(/(?<![A-Za-z$])\$\s*$/.test(antes) || /^\s*(?:ARS|pesos)/i.test(despues))) continue;
+    if (unidad && !/^\s*(?:m2|m²|mts2?|metros)/i.test(despues)) continue;
+    // Fragmento corto y legible: hasta 3 palabras antes y 3 después del número
+    const previas = texto.slice(Math.max(0, m.index - 60), m.index).trim().split(/\s+/).slice(-3).join(" ");
+    const siguientes = texto.slice(m.index + tok.length, m.index + tok.length + 60).trim().split(/\s+/).slice(0, 3).join(" ");
+    return [previas, tok, siguientes].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 90);
+  }
+  return null;
+}
+
+// Precio de una página sin datos estructurados: solo se acepta si hay UN solo monto en toda la página
+// (con avisos relacionados o expensas hay varios, y no se elige uno al azar).
+function precioUnicoEnTexto(texto) {
+  const usd = new Set();
+  const ars = new Set();
+  for (const m of texto.matchAll(/(?:USD|U\$S|US\$)\s?(\d{1,3}(?:[.,]\d{3})+)(?![\d.,])/gi)) usd.add(Number(m[1].replace(/[.,]/g, "")));
+  for (const m of texto.matchAll(/(?<![A-Za-z$])\$\s?(\d{1,3}(?:[.,]\d{3})+)(?![\d.,])/g)) ars.add(Number(m[1].replace(/[.,]/g, "")));
+  if (usd.size === 1 && ars.size === 0) return { valor: [...usd][0], moneda: "USD" };
+  if (ars.size === 1 && usd.size === 0) return { valor: [...ars][0], moneda: "ARS" };
+  return null;
+}
+
+// Tipo de inmueble tal como lo dice el título de la propia página
+function tipoDeTitulo(titulo) {
+  const m = sinTildes(titulo).match(/\b(casa quinta|casa|departamento|duplex|triplex|ph|chalet|lote|terreno|local|oficina|cochera|galpon|quinta)\b/);
+  if (!m) return null;
+  return m[1] === "ph" ? "PH" : m[1].charAt(0).toUpperCase() + m[1].slice(1);
+}
+
+const CAMPOS_M2 = ["m2_cubiertos", "m2_semicubiertos", "m2_descubiertos", "m2_balcon", "m2_terreno", "m2_totales"];
+
+// Contrasta lo que escribió el modelo con el texto de la página. Devuelve:
+//  - evidencia: lo que la página dice textualmente (precio y superficies), para comparar a ojo
+//  - anular: campos del modelo que la página NO confirma (se quitan: nunca se deja un dato sin respaldo)
+//  - caracteristicas: solo las que la página menciona
+function confirmarCampos(a, pagina, texto) {
+  const pg = pagina || {};
+  const norm = sinTildes(texto);
+  const evidencia = [];
+  const anular = [];
+
+  const estructurado = pg.precio > 0 && (pg.moneda === "USD" || pg.moneda === "ARS");
+  const precio = estructurado ? pg.precio : a.precio;
+  const moneda = estructurado ? pg.moneda : a.moneda;
+  if (precio) {
+    const f = buscarNumero(texto, precio, { moneda });
+    if (f) evidencia.push({ campo: "precio", texto: f });
+    else if (estructurado) evidencia.push({ campo: "precio", texto: `dato declarado por la página: ${moneda} ${Math.round(precio).toLocaleString("es-AR")}` });
+  }
+
+  const sup = { ...(pg.m2_totales ? { m2_totales: pg.m2_totales } : {}), ...(pg.superficies || {}) };
+  for (const c of CAMPOS_M2) {
+    const delaPagina = sup[c] != null;
+    const valor = delaPagina ? sup[c] : a[c];
+    if (valor == null) continue;
+    const f = valor > 0 ? buscarNumero(texto, valor, { unidad: true, redondeo: true }) : null;
+    if (f) evidencia.push({ campo: c, texto: f });
+    else if (!delaPagina) anular.push(c);
+  }
+
+  const tokens = t => sinTildes(t).replace(/[^a-z0-9ñ ]+/g, " ").split(" ").filter(x => x.length >= 3 || /^\d+$/.test(x));
+  const todos = t => { const k = tokens(t); return k.length > 0 && k.every(x => norm.includes(x)); };
+  const mitad = t => { const k = tokens(t); return k.length > 0 && k.filter(x => norm.includes(x)).length >= Math.ceil(k.length / 2); };
+  if (a.direccion && !todos(a.direccion)) anular.push("direccion");
+  if (a.barrio) {
+    const b = String(a.barrio).replace(/^(barrio\s+)?(privado|cerrado|abierto)\s+/i, "").replace(/^barrio\s+/i, "");
+    if (!todos(b)) anular.push("barrio");
+  }
+  if (a.localidad && !todos(a.localidad)) anular.push("localidad");
+  if (a.ubicacion && !mitad(a.ubicacion)) anular.push("ubicacion");
+  if (a.antiguedad && !norm.includes(sinTildes(a.antiguedad))) anular.push("antiguedad");
+  if (a.tipo && !norm.includes(sinTildes(a.tipo))) anular.push("tipo");
+  if (!pg.ambientes && a.ambientes && !new RegExp(`(?:^|[^0-9])${a.ambientes}\\s*(?:amb|ambientes)\\b`).test(norm)) anular.push("ambientes");
+  const caracteristicas = (a.caracteristicas || []).filter(c => norm.includes(sinTildes(c)));
+  return { evidencia, anular, caracteristicas };
+}
+
+// Links de avisos individuales que una página de listado trae en sus enlaces (mismo sitio, con el código del aviso en la ruta)
+function extraerLinksDeAvisos(html, urlBase, max) {
+  let base;
+  try { base = new URL(urlBase); } catch { return []; }
+  const host = base.hostname.replace(/^www\./, "");
+  const propia = claveLink(urlBase);
+  const vistos = new Set();
+  const out = [];
+  for (const m of String(html || "").matchAll(/<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["']/gi)) {
+    let u;
+    try { u = new URL(decodificar(m[1]).trim(), base); } catch { continue; }
+    if (!/^https?:$/.test(u.protocol) || u.hostname.replace(/^www\./, "") !== host) continue;
+    const link = limpiarLink(u.toString());
+    if (!link || !pareceUrlDeAviso(link)) continue;
+    const k = claveLink(link);
+    if (!k || k === propia || vistos.has(k)) continue;
+    vistos.add(k);
+    out.push(link);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+// Links de avisos que el servidor lee por su cuenta, además de los que escribió el modelo:
+//  1) resultados de la búsqueda web que ya son un aviso individual
+//  2) avisos que figuran como enlaces dentro de los listados que devolvió la búsqueda (se leen hasta MAX_LISTADOS_A_LEER)
+// Todos salen de páginas reales; nada se arma a partir de un título.
+async function candidatosDeResultados(resultados, yaTomadas, cache, cupo) {
+  const claves = new Set(yaTomadas);
+  const links = [];
+  const agregar = link => {
+    const k = claveLink(link);
+    if (!k || claves.has(k) || links.length >= cupo) return false;
+    claves.add(k);
+    links.push(link);
+    return true;
+  };
+  const listados = [];
+  for (const r of resultados || []) {
+    if (pareceUrlDeAviso(r.url)) agregar(r.url);
+    else listados.push(r);
+  }
+  const leidas = await Promise.all(listados.slice(0, MAX_LISTADOS_A_LEER).map(async r => ({ r, pag: await leerPaginaUnaVez(r.url, cache) })));
+  let listadosLeidos = 0;
+  let linksEnListados = 0;
+  const porListado = leidas.map(x => {
+    if (!x.pag?.html) return [];
+    listadosLeidos++;
+    const ls = extraerLinksDeAvisos(x.pag.html, x.pag.url || x.r.url, MAX_LINKS_POR_LISTADO);
+    linksEnListados += ls.length;
+    return ls;
+  });
+  // De a uno por listado, para que un solo listado no se lleve todo el cupo
+  for (let i = 0; i < MAX_LINKS_POR_LISTADO; i++) for (const ls of porListado) if (ls[i]) agregar(ls[i]);
+  return { links, listados_leidos: listadosLeidos, links_en_listados: linksEnListados };
+}
+
+async function verificarAviso(a, cache = new Map()) {
   if (!a.link) return { estado: "sin_link", motivo: "no trae el link del aviso" };
-  const r = await bajarPagina(a.link);
+  const r = await leerPaginaUnaVez(a.link, cache);
   if (r.error) return { estado: "inaccesible", motivo: MOTIVOS_ERROR[r.error] || "no se pudo abrir el link" };
-  if (r.status === 404 || r.status === 410) return { estado: "inaccesible", motivo: `el link no existe o el aviso se dio de baja (error ${r.status})` };
+  if (r.status === 404 || r.status === 410) return { estado: "inexistente", motivo: `el link no existe o el aviso se dio de baja (error ${r.status})` };
   if (!r.html) {
     const bloquea = [401, 403, 429, 503].includes(r.status);
     return { estado: "inaccesible", motivo: bloquea ? `el portal bloquea la verificación automática (error ${r.status})` : `el link responde con un error (${r.status})` };
@@ -782,26 +1053,47 @@ async function verificarAviso(a) {
   }
   const listado = pareceListado(r.url, r.html, texto);
   if (listado) return { estado: "listado", motivo: listado };
+  const portada = esPortadaDisfrazada(r.url, r.html);
+  if (portada) return { estado: "no_legible", motivo: portada };
 
-  const ev = evaluarDatos(a, texto, numerosDe(texto));
-  const aciertos = [ev.sup, ev.dir, ev.barrio].filter(x => x === true).length;
   const pagina = extraerDePagina(r.html);
   pagina.superficies = superficiesDeTexto(texto);
   // Si la página declara su precio de forma estructurada (JSON-LD) y no es un listado, el aviso existe y sus datos
   // salen de ahí, aunque el modelo los haya leído distinto.
   const precioEstructurado = pagina.precio > 0 && (pagina.moneda === "USD" || pagina.moneda === "ARS");
-  const ok = precioEstructurado || (a.precio ? ev.precio === true && aciertos >= 1 : aciertos >= 2);
+
+  if (a.solo_pagina) {
+    // El modelo no escribió nada de este aviso: todo sale de la página, y el precio solo se acepta sin ambigüedad
+    let precioOk = precioEstructurado;
+    if (!precioOk) {
+      const u = precioUnicoEnTexto(texto);
+      if (u) { pagina.precio = u.valor; pagina.moneda = u.moneda; precioOk = true; }
+    }
+    if (!precioOk && !Object.keys(pagina.superficies).length) {
+      return { estado: "no_legible", motivo: "no se pudo leer el precio ni la superficie de la página", pagina };
+    }
+    pagina.tipo = tipoDeTitulo(pagina.titulo || pagina.tituloMeta);
+    return { estado: "verificado", motivo: null, pagina, urlFinal: r.url, confirmacion: confirmarCampos({ ...a, precio: null }, pagina, texto) };
+  }
+
+  const ev = evaluarDatos(a, texto, numerosDe(texto));
+  const aciertos = [ev.sup, ev.dir, ev.barrio].filter(x => x === true).length;
+  // El número del precio tiene que aparecer junto a la moneda que informó el modelo (USD vs pesos)
+  const monedaOk = !a.precio || precioEstructurado || !!buscarNumero(texto, a.precio, { moneda: a.moneda });
+  const ok = precioEstructurado || (a.precio ? ev.precio === true && monedaOk && aciertos >= 1 : aciertos >= 2);
   if (!ok) {
     const motivo = a.precio && ev.precio !== true
       ? `el precio publicado (${fmtPrecio(a)}) no se ve en la página del link`
-      : "los datos del aviso (superficie, dirección) no se ven en la página del link";
+      : a.precio && !monedaOk
+        ? `el monto ${Math.round(a.precio).toLocaleString("es-AR")} aparece en la página pero no con la moneda informada (${a.moneda || "sin moneda"})`
+        : "los datos del aviso (superficie, dirección) no se ven en la página del link";
     return { estado: "no_coincide", motivo, pagina };
   }
-  return { estado: "verificado", motivo: null, pagina, urlFinal: r.url };
+  return { estado: "verificado", motivo: null, pagina, urlFinal: r.url, confirmacion: confirmarCampos(a, pagina, texto) };
 }
 
 // Verifica todos los avisos con hasta 6 consultas en paralelo y un tope de tiempo total
-async function verificarAvisos(avisos) {
+async function verificarAvisos(avisos, cache = new Map()) {
   const limite = Date.now() + VERIF_PRESUPUESTO_MS;
   const res = new Array(avisos.length);
   let i = 0;
@@ -810,7 +1102,7 @@ async function verificarAvisos(avisos) {
       const k = i++;
       if (k >= avisos.length) return;
       if (Date.now() > limite) { res[k] = { estado: "no_verificado", motivo: "se agotó el tiempo de verificación" }; continue; }
-      try { res[k] = await verificarAviso(avisos[k]); }
+      try { res[k] = await verificarAviso(avisos[k], cache); }
       catch { res[k] = { estado: "inaccesible", motivo: "no se pudo abrir el link" }; }
     }
   }
@@ -819,13 +1111,19 @@ async function verificarAvisos(avisos) {
 }
 
 // Guarda en el aviso el resultado de la verificación. Si el aviso se verificó, los datos que la propia página
-// muestra (precio, superficies, ubicación) reemplazan a los del modelo y se recalcula el USD/m².
-// Devuelve el aviso (nuevo, ya recalculado).
+// muestra (precio, superficies, ubicación) reemplazan a los del modelo, lo que la página no confirma se quita
+// y se recalcula el USD/m². Devuelve el aviso (nuevo, ya recalculado).
 function aplicarVerificacion(a, v) {
   const pg = v.pagina;
   const nuevo = { ...a, verificacion: { estado: v.estado, motivo: v.motivo || null } };
   const dePagina = [];
   if (v.estado === "verificado" && pg) {
+    const conf = v.confirmacion;
+    if (conf) {
+      for (const c of conf.anular) nuevo[c] = null;
+      nuevo.caracteristicas = conf.caracteristicas;
+      if (conf.evidencia.length) nuevo.evidencia = conf.evidencia;
+    }
     if (pg.precio > 0 && (pg.moneda === "USD" || pg.moneda === "ARS")) {
       if (nuevo.precio !== pg.precio || nuevo.moneda !== pg.moneda) dePagina.push("precio");
       nuevo.precio = pg.precio;
@@ -836,7 +1134,9 @@ function aplicarVerificacion(a, v) {
       if (valor != null && nuevo[campo] !== valor) { nuevo[campo] = valor; dePagina.push(campo); }
     }
     if (!nuevo.ambientes && pg.ambientes) nuevo.ambientes = pg.ambientes;
-    if (pg.titulo) nuevo.titulo = pg.titulo;
+    const titulo = pg.titulo || pg.tituloMeta;
+    if (titulo) nuevo.titulo = titulo;
+    if (a.solo_pagina && pg.tipo) nuevo.tipo = pg.tipo;
     if (pg.lat != null && pg.lng != null) {
       nuevo.lat = pg.lat; nuevo.lng = pg.lng;
       nuevo.ubic_precision = pg.conAltura ? "exacta" : "calle";
@@ -845,7 +1145,9 @@ function aplicarVerificacion(a, v) {
     if (!nuevo.direccion && pg.direccion) nuevo.direccion = pg.direccion;
     if (!nuevo.localidad && pg.localidad) nuevo.localidad = pg.localidad;
   }
-  if (dePagina.length) nuevo.datos_pagina = dePagina;
+  // El nombre del portal sale del dominio del link, no de lo que diga el modelo
+  if (nuevo.link) nuevo.fuente = fuenteDeLink(nuevo.link) || nuevo.fuente;
+  if (dePagina.length && !a.solo_pagina) nuevo.datos_pagina = dePagina;
   // Se vuelve a normalizar para recalcular superficie homologada, USD/m² y advertencias con los datos finales
   const [rec] = normalizarAvisos([nuevo], null);
   return rec || nuevo;
@@ -1106,6 +1408,7 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
     return {
       texto: resp.content.filter(b => b.type === "text").map(b => b.text).join("\n"),
       urlsVistas: recolectarUrls(bloques),
+      resultadosWeb: recolectarResultados(bloques),
       busquedasWeb: uso.busquedas || bloques.filter(b => b.type === "server_tool_use").length,
       uso: { ...uso, modelo, costo_usd: costoEstimado({ ...uso, busquedas: uso.busquedas || bloques.filter(b => b.type === "server_tool_use").length }, modelo) },
     };
@@ -1154,7 +1457,7 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
         return res.status(429).json({ error: `Llegaste al límite de ${MAX_POR_DIA_Y_TENANT} búsquedas por día. Probá mañana.` });
       }
 
-      const { texto, urlsVistas, busquedasWeb, uso } = await buscarConClaude(params, previosN);
+      const { texto, urlsVistas, resultadosWeb, busquedasWeb, uso } = await buscarConClaude(params, previosN);
 
       let parsed;
       try {
@@ -1164,37 +1467,72 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
       }
 
       const idsPrevios = new Set(previosN.map(a => a.id));
-      const candidatos = quitarDuplicados(
-        normalizarAvisos(limpiarSalidaModelo(parsed.avisos), urlsVistas).filter(a => !idsPrevios.has(a.id)),
-        previosN
-      ).slice(0, Math.min(MAX_AVISOS_POR_BUSQUEDA, MAX_AVISOS_TOTAL - previosN.length));
+      const clavesPrevias = new Set(previosN.map(a => a.link && claveLink(a.link)).filter(Boolean));
+      const descartar = (a, estado, motivo) => ({ ...a, verificacion: { estado, motivo } });
 
-      // Se abre el link de cada aviso nuevo. En modo estricto solo quedan los verificados.
-      let nuevos = candidatos;
-      let descartados = [];
-      if (VERIFICAR_MODO !== "off" && candidatos.length) {
-        const vers = await verificarAvisos(candidatos);
-        const conVerif = candidatos.map((a, k) => aplicarVerificacion(a, vers[k]));
-        // Con los datos de la página puede haber duplicados nuevos (mismo precio y dirección)
-        const sinDup = quitarDuplicados(conVerif, previosN);
-        if (VERIFICAR_MODO === "estricto") {
-          descartados = sinDup.filter(a => a.verificacion.estado !== "verificado");
-          nuevos = sinDup.filter(a => a.verificacion.estado === "verificado");
-        } else {
-          nuevos = sinDup;
-        }
+      // 1) Un aviso solo vale si trae un link que la búsqueda web devolvió de verdad. Los links que armó el modelo
+      //    (por ejemplo, un slug inventado a partir del título) y los avisos sin link se descartan siempre.
+      const delModelo = [];
+      const descartados = [];
+      for (const a of normalizarAvisos(limpiarSalidaModelo(parsed.avisos), urlsVistas).filter(a => !idsPrevios.has(a.id))) {
+        if (!a.link) { descartados.push(descartar(a, "sin_link", "el aviso no trae el link de su publicación")); continue; }
+        const k = claveLink(a.link);
+        if (!urlsVistas.has(k)) { descartados.push(descartar(a, "link_no_visto", "el link no aparece en los resultados de la búsqueda: lo armó el modelo, no es de una publicación real")); continue; }
+        if (clavesPrevias.has(k)) continue;
+        delModelo.push(a);
       }
+      const delModeloCap = quitarDuplicados(delModelo, previosN)
+        .slice(0, Math.min(MAX_AVISOS_POR_BUSQUEDA, MAX_AVISOS_TOTAL - previosN.length));
+
+      // 2) Avisos que el servidor encuentra por su cuenta en los resultados (individuales o enlazados desde listados)
+      //    y lee de su propia página: el modelo no escribió ningún dato de ellos.
+      let delListado = { links: [], listados_leidos: 0, links_en_listados: 0 };
+      const paginas = new Map();
+      if (VERIFICAR_MODO !== "off") {
+        const yaTomadas = new Set([...clavesPrevias, ...delModeloCap.map(a => claveLink(a.link))]);
+        delListado = await candidatosDeResultados(resultadosWeb, yaTomadas, paginas, Math.max(0, MAX_CANDIDATOS - delModeloCap.length));
+      }
+      const soloPagina = normalizarAvisos(delListado.links.map(link => ({ titulo: "", link, solo_pagina: true })), null);
+      const candidatos = [...delModeloCap, ...soloPagina];
+
+      // 3) Se abre el link de cada aviso y se contrasta con su página. Los datos de la página mandan.
+      let nuevos = candidatos;
+      let ilegiblesListado = 0;
+      if (VERIFICAR_MODO !== "off" && candidatos.length) {
+        const vers = await verificarAvisos(candidatos, paginas);
+        const conVerif = candidatos.map((a, k) => aplicarVerificacion(a, vers[k]));
+        // Con los datos de la página puede haber duplicados nuevos (mismo precio y dirección): se prefieren los verificados
+        const ordenados = [...conVerif.filter(a => a.verificacion.estado === "verificado"), ...conVerif.filter(a => a.verificacion.estado !== "verificado")];
+        const sinDup = quitarDuplicados(ordenados, previosN);
+        // Quedan como "sin verificar" solo los avisos cuyo link existe pero el portal no dejó leer (bloqueo, error, tiempo).
+        // Si la página se leyó y no coincide, es un listado o no existe, el aviso se descarta.
+        const QUEDAN = new Set(["inaccesible", "no_legible", "no_verificado"]);
+        const conservar = [];
+        for (const a of sinDup) {
+          const ok = a.verificacion.estado === "verificado";
+          if (a.solo_pagina && !ok) { ilegiblesListado++; continue; }
+          if (ok || (VERIFICAR_MODO === "marcar" && QUEDAN.has(a.verificacion.estado))) conservar.push(a);
+          else descartados.push(a);
+        }
+        nuevos = conservar;
+      }
+      nuevos = nuevos.slice(0, Math.min(MAX_AVISOS_POR_BUSQUEDA, MAX_AVISOS_TOTAL - previosN.length));
+
       const avisos = [...previosN, ...nuevos];
       const porMotivo = {};
       for (const a of descartados) porMotivo[a.verificacion.estado] = (porMotivo[a.verificacion.estado] || 0) + 1;
       const verificados = avisos.filter(a => a.verificacion?.estado === "verificado").length;
+      const sinVerificar = avisos.filter(a => a.verificacion && a.verificacion.estado !== "verificado").length;
 
       const nota = typeof parsed.notas === "string" ? parsed.notas : "";
       const duracion = Date.now() - inicio;
       const sinLink = nuevos.filter(a => !a.link).length;
       console.log(
-        `[comparables] buscar${ampliar ? " (ampliar)" : ""}: ${candidatos.length} avisos, ${nuevos.length} verificados, ${descartados.length} descartados ` +
-        `${JSON.stringify(porMotivo)}, ${busquedasWeb} búsquedas web, ${uso.input_tokens} tokens de entrada, ${uso.output_tokens} de salida, ` +
+        `[comparables] buscar${ampliar ? " (ampliar)" : ""}: ${normalizarAvisosCantidad(parsed.avisos)} avisos del modelo, ` +
+        `${nuevos.length} quedan (${verificados} verificados, ${sinVerificar} sin verificar), ${descartados.length} descartados ` +
+        `${JSON.stringify(porMotivo)}, listados leídos ${delListado.listados_leidos} (${delListado.links_en_listados} links), ` +
+        `${soloPagina.length} avisos leídos de su página (${ilegiblesListado} ilegibles), ` +
+        `${busquedasWeb} búsquedas web, ${uso.input_tokens} tokens de entrada, ${uso.output_tokens} de salida, ` +
         `costo estimado USD ${uso.costo_usd ?? "?"} (${uso.modelo}), ${duracion} ms`
       );
 
@@ -1203,7 +1541,7 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
         avisos,
         nuevos: nuevos.length,
         // Si se descartaron avisos, seguir buscando sigue teniendo sentido aunque entren pocos
-        hay_mas: avisos.length < MAX_AVISOS_TOTAL && candidatos.length > 0 &&
+        hay_mas: avisos.length < MAX_AVISOS_TOTAL && (candidatos.length > 0 || descartados.length > 0) &&
           (parsed.hay_mas === true || candidatos.length >= MAX_AVISOS_POR_BUSQUEDA),
         estadisticas: calcularEstadisticas(avisos),
         notas: ampliar ? `Se sumaron ${nuevos.length} avisos nuevos. ${nota}`.trim() : nota,
@@ -1214,9 +1552,16 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
         verificacion: {
           modo: VERIFICAR_MODO,
           verificados,
+          sin_verificar: sinVerificar,
           descartados: descartados.length,
           por_motivo: porMotivo,
           lista: descartados.slice(0, 40).map(a => ({ titulo: a.titulo, fuente: a.fuente, link: a.link, estado: a.verificacion.estado, motivo: a.verificacion.motivo })),
+          de_listados: {
+            listados_leidos: delListado.listados_leidos,
+            links_encontrados: delListado.links_en_listados,
+            avisos_leidos: soloPagina.length - ilegiblesListado,
+            ilegibles: ilegiblesListado,
+          },
         },
         consumo: {
           modelo: uso.modelo,
@@ -1427,4 +1772,6 @@ module.exports._internals = {
   tokkoToProp, parcheTokko, medidas,
   htmlATexto, numerosDe, pareceListado, evaluarDatos, extraerDePagina, superficiesDeTexto, verificarAviso, verificarAvisos, aplicarVerificacion,
   quitarDuplicados, limpiarSalidaModelo, esIpPrivada, hostSeguro, costoEstimado, preciosDeModelo,
+  recolectarResultados, pareceUrlDeAviso, fuenteDeLink, esPortadaDisfrazada, buscarNumero, precioUnicoEnTexto,
+  confirmarCampos, extraerLinksDeAvisos, candidatosDeResultados, tipoDeTitulo, leerPaginaUnaVez,
 };
