@@ -15,6 +15,29 @@ const CASILLA_TENANT = {
 
 const REMITENTE_LEADS = "info@dicio.com.ar";
 
+// ── Avisos al celular por mail ────────────────────────────────────────────
+// Un mail dispara aviso SOLO si (a) es la respuesta de un lead ya cargado en
+// emp_leads, o (b) menciona alguno de estos términos en el asunto, el nombre
+// del remitente o el cuerpo (se compara sin tildes ni mayúsculas). El resto
+// de los mails se procesa igual pero no avisa. Para sumar otro emprendimiento
+// o palabra clave, agregar otra regex a esta lista.
+const TERMINOS_AVISO_MAIL = [/tortugas?\s*-?\s*woods?/];
+
+function normalizarTexto(s) {
+  return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+}
+
+function mailMencionaTermino(parsedMail) {
+  const cuerpo = parsedMail.text
+    || (typeof parsedMail.html === "string" ? parsedMail.html.replace(/<[^>]+>/g, " ") : "");
+  const haystack = normalizarTexto([
+    parsedMail.subject,
+    parsedMail.from?.value?.[0]?.name,
+    cuerpo,
+  ].filter(Boolean).join("\n"));
+  return TERMINOS_AVISO_MAIL.some(re => re.test(haystack));
+}
+
 // Fase 12 — nombre del estado al que pasa un lead que respondió por mail.
 const ESTADO_RESPUESTA_NOMBRE = "Respuesta de lead contactado por mail";
 
@@ -256,10 +279,14 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery, notificar 
               if (lead) {
                 const row = await upsertLead(tenantId, lead);
                 console.log(`[emp-leads] Procesado lead_id_externo=${lead.lead_id_externo} → fila id=${row?.id}`);
-                notificar(
-                  `${lead.nombre || "(sin nombre)"}${lead.telefono ? " - " + lead.telefono : ""}${lead.email ? " - " + lead.email : ""}`,
-                  "Nuevo lead"
-                ).catch(() => {});
+                if (mailMencionaTermino(parsed)) {
+                  notificar(
+                    `${lead.nombre || "(sin nombre)"}${lead.telefono ? " - " + lead.telefono : ""}${lead.email ? " - " + lead.email : ""}`,
+                    "Nuevo lead"
+                  ).catch(() => {});
+                } else {
+                  console.log(`[emp-leads] Lead ${lead.lead_id_externo} guardado sin aviso (no menciona ningún término de TERMINOS_AVISO_MAIL).`);
+                }
               }
             } else if (remitente && remitente !== casilla.toLowerCase()) {
               // Fase 12: ¿es la respuesta de un lead ya cargado para este tenant?
@@ -269,10 +296,15 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery, notificar 
                 console.log(`[emp-leads] Respuesta de mail registrada — lead id=${leadExistente.id} (${remitente})`);
                 notificar(`De: ${remitente}`, "Respuesta de lead por mail").catch(() => {});
               } else {
-                // No matchea ningún lead conocido — igual se avisa porque
-                // llegó un mail nuevo a la casilla, aunque no se guarde nada.
-                const asunto = parsed.subject || "(sin asunto)";
-                notificar(`De: ${remitente}\nAsunto: ${asunto}`, "Nuevo mail").catch(() => {});
+                // No matchea ningún lead conocido — solo se avisa si el mail
+                // menciona alguno de TERMINOS_AVISO_MAIL (ej. Tortugas Woods).
+                // Los demás mails se marcan como leídos sin aviso.
+                if (mailMencionaTermino(parsed)) {
+                  const asunto = parsed.subject || "(sin asunto)";
+                  notificar(`De: ${remitente}\nAsunto: ${asunto}`, "Nuevo mail").catch(() => {});
+                } else {
+                  console.log(`[emp-leads] Mail de ${remitente} sin aviso (no es de un lead ni menciona ningún término de TERMINOS_AVISO_MAIL).`);
+                }
               }
             }
           } catch (e) {
@@ -415,3 +447,5 @@ module.exports = function crearModuloLeads({ SB_URL, SB_KEY, sbQuery, notificar 
 
   return { router, iniciarPolling };
 };
+
+module.exports.mailMencionaTermino = mailMencionaTermino;
