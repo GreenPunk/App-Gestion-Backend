@@ -62,6 +62,9 @@ let limiteMensajeriaCache = { data: null, ts: 0 };
 // Desde el 1001 Meta los cobra. Las plantillas NO entran en este tope: se
 // cobran aparte según su categoría. El mes se reinicia a las 0:00 en la zona
 // horaria de la cuenta de mensajería (Argentina, UTC-3, sin horario de verano).
+// Dominio del frontend para armar el link de los avisos (override: env FRONTEND_URL).
+const FRONTEND_URL_DEFAULT = "https://app-saa-s-gestion-inmobiliaria.vercel.app";
+
 const GRATIS_SERVICIO_MES = 1000;
 const OFFSET_ARGENTINA_MS = 3 * 60 * 60 * 1000;
 
@@ -710,8 +713,11 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery, notific
           // un mensaje nuevo, se banca solo si faltan las env vars del
           // módulo de notificaciones (ver notificaciones.js).
           const cuerpoAviso = cuerpo.length > 300 ? cuerpo.slice(0, 300) + "…" : cuerpo;
+          // Link directo a la conversación en el acceso aparte /whatsapp (la
+          // PWA del celular). Se puede cambiar el dominio con FRONTEND_URL en Render.
+          const urlFront = (process.env.FRONTEND_URL || FRONTEND_URL_DEFAULT).replace(/\/+$/, "");
           notificar(
-            `De: ${nombreContacto || telefono}\n${cuerpoAviso}`,
+            `De: ${nombreContacto || telefono}\n${cuerpoAviso}\n${urlFront}/whatsapp?conv=${conv.id}`,
             "Nuevo WhatsApp"
           ).catch(() => {});
         }
