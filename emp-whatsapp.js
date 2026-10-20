@@ -56,6 +56,27 @@ let plantillasCache = { data: null, ts: 0 };
 const LIMITE_MENSAJERIA_CACHE_MS = 2 * 60 * 1000;
 let limiteMensajeriaCache = { data: null, ts: 0 };
 
+// Medidor de mensajes gratis (política de precios de Meta desde el 1/10/2026):
+// cada número de negocio tiene 1.000 mensajes de servicio gratis por mes
+// (respuestas libres dentro de la ventana de 24hs: texto, imágenes, archivos).
+// Desde el 1001 Meta los cobra. Las plantillas NO entran en este tope: se
+// cobran aparte según su categoría. El mes se reinicia a las 0:00 en la zona
+// horaria de la cuenta de mensajería (Argentina, UTC-3, sin horario de verano).
+const GRATIS_SERVICIO_MES = 1000;
+const OFFSET_ARGENTINA_MS = 3 * 60 * 60 * 1000;
+
+// Devuelve el inicio del mes actual y el inicio del mes siguiente (= próximo
+// reinicio), ambos como Date en UTC, calculados en hora de Argentina.
+function limitesMesArgentina(ahoraMs = Date.now()) {
+  const local = new Date(ahoraMs - OFFSET_ARGENTINA_MS); // campos UTC = hora de pared argentina
+  const y = local.getUTCFullYear();
+  const m = local.getUTCMonth();
+  return {
+    desde: new Date(Date.UTC(y, m, 1) + OFFSET_ARGENTINA_MS),
+    hasta: new Date(Date.UTC(y, m + 1, 1) + OFFSET_ARGENTINA_MS),
+  };
+}
+
 module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery, notificar = async () => {} }) {
   const router = express.Router();
 
@@ -929,6 +950,58 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery, notific
     return usados;
   }
 
+  // ── Medidor de mensajes gratis del mes ──────────────────────
+  // Cuenta filas de emp_whatsapp_mensajes con la cabecera Content-Range de
+  // PostgREST (no trae las filas, solo el total). El WhatsApp de la app es un
+  // único número compartido por todos los tenants, así que NO se filtra por
+  // tenant: el tope de Meta es por número.
+  async function contarMensajes(filtro) {
+    const res = await fetch(`${SB_URL}/rest/v1/emp_whatsapp_mensajes?select=id&${filtro}&limit=1`, {
+      headers: {
+        "apikey": SB_KEY,
+        "Authorization": `Bearer ${SB_KEY}`,
+        "Prefer": "count=exact",
+      },
+    });
+    if (!res.ok) {
+      const e = await res.text();
+      throw new Error(`Supabase count emp_whatsapp_mensajes error ${res.status}: ${e}`);
+    }
+    const rango = res.headers.get("content-range") || ""; // "0-0/27" o "*/0"
+    const total = parseInt(rango.split("/")[1], 10);
+    return Number.isFinite(total) ? total : 0;
+  }
+
+  // ── GET /api/whatsapp/mensajes-gratis ─────────────────────────
+  // Respuestas libres (tipo texto/media) entregadas o leídas en el mes en
+  // curso, contra el tope gratis de Meta. "entregado" es el estado viejo en
+  // español que quedó en algunas filas históricas. Las plantillas se cuentan
+  // aparte, solo informativas (se cobran sí o sí).
+  router.get("/mensajes-gratis", async (req, res) => {
+    try {
+      const { desde, hasta } = limitesMesArgentina();
+      const rangoMes = `created_at=gte.${encodeURIComponent(desde.toISOString())}&created_at=lt.${encodeURIComponent(hasta.toISOString())}`;
+      const base = `direccion=eq.saliente&estado=in.(delivered,read,entregado)&${rangoMes}`;
+      const [gratisUsados, plantillasEntregadas] = await Promise.all([
+        contarMensajes(`${base}&tipo=in.(texto,media)`),
+        contarMensajes(`${base}&tipo=eq.template`),
+      ]);
+      res.json({
+        ok: true,
+        gratisTope: GRATIS_SERVICIO_MES,
+        gratisUsados,
+        gratisRestantes: Math.max(0, GRATIS_SERVICIO_MES - gratisUsados),
+        plantillasEntregadas,
+        mesDesde: desde.toISOString(),
+        reinicio: hasta.toISOString(),
+        calculadoEn: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.error("[whatsapp] Error en /mensajes-gratis:", e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
   // ── GET /api/whatsapp/limite-mensajeria — WA-MEJ-31 ───────────
   router.get("/limite-mensajeria", async (req, res) => {
     const { tenantId } = req.query || {};
@@ -1187,3 +1260,5 @@ module.exports = function crearModuloWhatsapp({ SB_URL, SB_KEY, sbQuery, notific
 
   return { router };
 };
+
+module.exports.limitesMesArgentina = limitesMesArgentina;
