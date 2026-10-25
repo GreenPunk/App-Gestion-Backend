@@ -13,13 +13,20 @@
  *   POST /api/comparables/propiedades/actualizar → trae propiedades nuevas y datos faltantes desde Tokko (usa tenants.tokko_key)
  *   POST /api/comparables/historial/agrupar → pone (o saca) un grupo a una o varias búsquedas guardadas
  *   POST /api/comparables/historial/borrar  → borra una o varias búsquedas guardadas
+ *   POST /api/comparables/historial/completar → completa o corrige avisos guardados, sin repetir la búsqueda ni gastar tokens:
+ *                                         modo "pagina" (vuelve a leer el link), "texto" (texto pegado) o "manual" (carga a mano)
+ *   GET  /api/comparables/para-tasacion → avisos de la búsqueda guardada de una propiedad, en el esquema de Tasaciones, con su fecha
+ *
+ * Cada aviso trae, además de precio y superficies: dormitorios, baños, estacionamiento, antigüedad, condición, orientación,
+ * disposición y expensas, leídos de la ficha de cada portal (Argenprop, Zonaprop, MercadoLibre) con su cita textual.
+ * origen_campos dice de dónde salió cada dato (pagina, texto_pegado, manual); faltantes y completitud, qué no se publicó.
  *
  * Mismo patrón que emp-leads.js / emp-whatsapp.js: factory que recibe las
  * credenciales de Supabase ya armadas en server.js y devuelve un router.
  * No suma dependencias ni variables de entorno nuevas.
  * Opcionales: COMPARABLES_MODEL, COMPARABLES_MAX_SEARCHES (10),
  * COMPARABLES_MAX_POR_HORA (15), COMPARABLES_MAX_AVISOS (20),
- * COMPARABLES_GEO_POR_HORA (400), GEOCODER_UA.
+ * COMPARABLES_GEO_POR_HORA (400), COMPARABLES_COMPLETAR_POR_HORA (60), GEOCODER_UA.
  * ─────────────────────────────────────────────────────────────
  */
 const express = require("express");
@@ -272,11 +279,69 @@ function superficieBase({ tipo, m2Tot, m2Cub, m2Sem, m2Des, m2Bal, m2Ter }) {
 // por ejemplo con avisos que ya vienen de una búsqueda anterior)
 const ORIGENES_UBICACION = ["direccion", "mapa", "titulo_o_url", "ninguna"];
 
+// ── Datos del aviso para tasar: núcleo y opcionales ──────────
+// Núcleo: lo que hace falta para usar el aviso como comparable. Opcionales: suman información pero no bloquean nada.
+// "Faltante" quiere decir que el aviso no lo publica (o no se pudo leer): nunca se completa por deducción.
+const aEnteroHasta = (v, max) => { const n = aNumeroOCero(v); return n != null && Number.isInteger(n) && n <= max ? n : null; };
+const aExpensas = v => {
+  if (!v || typeof v !== "object") return null;
+  const monto = aNumero(v.monto);
+  return monto && (v.moneda === "ARS" || v.moneda === "USD") ? { monto, moneda: v.moneda } : null;
+};
+const ORIGENES_DATO = ["pagina", "texto_pegado", "manual", "busqueda"];
+function sanearOrigen(o) {
+  if (!o || typeof o !== "object") return null;
+  const out = {};
+  for (const [k, v] of Object.entries(o).slice(0, 40)) if (/^[a-z0-9_]{1,24}$/.test(k) && ORIGENES_DATO.includes(v)) out[k] = v;
+  return Object.keys(out).length ? out : null;
+}
+function sanearOriginales(o) {
+  if (!o || typeof o !== "object") return null;
+  const out = {};
+  for (const [k, v] of Object.entries(o).slice(0, 20)) {
+    if (!/^[a-z0-9_]{1,24}$/.test(k)) continue;
+    if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+    else if (typeof v === "string" && v.trim()) out[k] = v.trim().slice(0, 80);
+    else if (v && typeof v === "object" && aExpensas(v)) out[k] = aExpensas(v);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+const TIPOS_COMERCIALES = /local|oficina|galpon|deposito|cochera|fondo de comercio/;
+const TIPOS_CON_TERRENO = /casa|quinta|chalet|chacra|campo/;
+function datosDelAviso(a) {
+  const tipo = sinTildes(a.tipo || "");
+  const esLote = /lote|terreno/.test(tipo);
+  const esComercial = TIPOS_COMERCIALES.test(tipo);
+  const tiene = c => (c === "precio" ? !!(a.precio && a.moneda) : a[c] != null);
+  let nucleo;
+  if (esLote) nucleo = ["precio", a.m2_terreno != null || a.m2_totales == null ? "m2_terreno" : "m2_totales"];
+  else if (esComercial) nucleo = ["precio", "m2_cubiertos", "antiguedad", "condicion"];
+  else {
+    nucleo = ["precio", "m2_cubiertos", "dormitorios", "banos", "estacionamiento", "antiguedad", "condicion"];
+    if (TIPOS_CON_TERRENO.test(tipo)) nucleo.push("m2_terreno");
+  }
+  const opcionales = esLote ? ["orientacion", "expensas"] : ["ambientes", "orientacion", "disposicion", "expensas", "m2_semicubiertos", "m2_descubiertos", "m2_balcon"];
+  return { nucleo, opcionales, tiene };
+}
+// faltantes: del núcleo · faltantes_opc: de los opcionales · completitud: % del núcleo que el aviso trae
+function completitudDe(a) {
+  const { nucleo, opcionales, tiene } = datosDelAviso(a);
+  const faltantes = nucleo.filter(c => !tiene(c));
+  return {
+    faltantes,
+    faltantes_opc: opcionales.filter(c => !tiene(c)),
+    completitud: Math.round(((nucleo.length - faltantes.length) / nucleo.length) * 100),
+  };
+}
+
 // Lo que el modelo no tiene que decidir (lo agrega el servidor): se descarta de su respuesta
 function limpiarSalidaModelo(lista) {
   return (Array.isArray(lista) ? lista : []).map(r =>
     r && typeof r === "object"
-      ? { ...r, verificacion: undefined, lat: undefined, lng: undefined, ubic_precision: undefined, ubic_origen: undefined, flags: undefined }
+      ? { ...r, verificacion: undefined, lat: undefined, lng: undefined, ubic_precision: undefined, ubic_origen: undefined, flags: undefined,
+        dormitorios: undefined, banos: undefined, estacionamiento: undefined, condicion: undefined, orientacion: undefined, disposicion: undefined, expensas: undefined,
+        origen_campos: undefined, originales: undefined, editado_a_mano: undefined, confirmado_a_mano: undefined, faltantes: undefined, faltantes_opc: undefined, completitud: undefined }
       : r
   );
 }
@@ -305,6 +370,9 @@ function normalizarAvisos(lista, urlsVistas) {
     const sup = superficieBase({ tipo: tipoAviso, m2Tot, m2Cub, m2Sem, m2Des, m2Bal, m2Ter });
     const base = sup.m2;
 
+    const origenOk = sanearOrigen(raw.origen_campos);
+    const originalesOk = sanearOriginales(raw.originales);
+
     const flags = [];
     if (!precio) flags.push("sin_precio");
     else if (!moneda) flags.push("sin_moneda");
@@ -319,7 +387,7 @@ function normalizarAvisos(lista, urlsVistas) {
       flags.push("link_no_verificado");
     }
 
-    out.push({
+    const aviso = {
       id: hashCorto(clave),
       titulo,
       ubicacion: aTexto(raw.ubicacion),
@@ -340,6 +408,18 @@ function normalizarAvisos(lista, urlsVistas) {
       ambientes: aNumero(raw.ambientes),
       antiguedad: aTexto(raw.antiguedad, 60),
       caracteristicas: Array.isArray(raw.caracteristicas) ? raw.caracteristicas.slice(0, 8).map(c => String(c).slice(0, 60)) : [],
+      // Datos de la ficha: salen de la página, de un texto pegado o de una carga manual (ver origen_campos); el modelo no los escribe
+      dormitorios: aEnteroHasta(raw.dormitorios, 30),
+      banos: aEnteroHasta(raw.banos, 30),
+      estacionamiento: aEnteroHasta(raw.estacionamiento, 30),
+      condicion: aTexto(raw.condicion, 40),
+      orientacion: aTexto(raw.orientacion, 30),
+      disposicion: aTexto(raw.disposicion, 30),
+      expensas: aExpensas(raw.expensas),
+      ...(origenOk ? { origen_campos: origenOk } : {}),
+      ...(originalesOk ? { originales: originalesOk } : {}),
+      ...(raw.editado_a_mano ? { editado_a_mano: true } : {}),
+      ...(raw.confirmado_a_mano ? { confirmado_a_mano: true } : {}),
       fuente: String(raw.fuente || "").slice(0, 60),
       ubicacion_origen: ORIGENES_UBICACION.includes(raw.ubicacion_origen) ? raw.ubicacion_origen : null,
       link,
@@ -350,7 +430,7 @@ function normalizarAvisos(lista, urlsVistas) {
       ...(raw.solo_pagina ? { solo_pagina: true } : {}),
       // Lo que la página dice textualmente, para comparar a ojo: [{ campo, texto }]
       ...(Array.isArray(raw.evidencia) && raw.evidencia.length
-        ? { evidencia: raw.evidencia.slice(0, 10).map(e => ({ campo: String(e?.campo || "").slice(0, 20), texto: String(e?.texto || "").slice(0, 90) })).filter(e => e.campo && e.texto) }
+        ? { evidencia: raw.evidencia.slice(0, 24).map(e => ({ campo: String(e?.campo || "").slice(0, 20), texto: String(e?.texto || "").slice(0, 90) })).filter(e => e.campo && e.texto) }
         : {}),
       ...(raw.verificacion && typeof raw.verificacion.estado === "string"
         ? { verificacion: { estado: raw.verificacion.estado.slice(0, 20), motivo: aTexto(raw.verificacion.motivo, 200) } }
@@ -361,7 +441,9 @@ function normalizarAvisos(lista, urlsVistas) {
       usd_m2: moneda === "USD" && base ? Math.round(precio / base) : null,
       flags,
       atipico: false,
-    });
+    };
+    Object.assign(aviso, completitudDe(aviso));
+    out.push(aviso);
   }
   return out;
 }
@@ -409,7 +491,7 @@ function medidas(vals) {
 //  - precio publicado (estadisticas.precio): todos los avisos con precio en dólares, tengan o no superficie
 // Los avisos marcados como atípicos por su USD/m² (muy fuera de la zona) quedan fuera de ambos.
 // Un aviso entra en las estadísticas si no se verificó nada (búsquedas viejas) o si su link se verificó bien
-const entraEnEstadisticas = a => !a.verificacion || a.verificacion.estado === "verificado";
+const entraEnEstadisticas = a => !a.verificacion || a.verificacion.estado === "verificado" || a.confirmado_a_mano === true;
 
 function calcularEstadisticas(avisos) {
   avisos.forEach(a => { a.atipico = false; });
@@ -640,10 +722,22 @@ async function bajarPagina(url) {
   return { error: "demasiadas_redirecciones" };
 }
 
-const ENTIDADES = { "&nbsp;": " ", "&amp;": "&", "&quot;": '"', "&#39;": "'", "&apos;": "'", "&lt;": "<", "&gt;": ">", "&ordm;": "º", "&sup2;": "²" };
+// Entidades HTML: con nombre (&ntilde;), decimales (&#241;) y hexadecimales (&#xF1;, que usa Argenprop en la ficha)
+const ENTIDADES = {
+  nbsp: " ", amp: "&", quot: '"', apos: "'", lt: "<", gt: ">", ordm: "º", ordf: "ª", sup2: "²", sup3: "³", deg: "°", middot: "·",
+  iexcl: "¡", iquest: "¿", ntilde: "ñ", Ntilde: "Ñ", aacute: "á", eacute: "é", iacute: "í", oacute: "ó", uacute: "ú",
+  Aacute: "Á", Eacute: "É", Iacute: "Í", Oacute: "Ó", Uacute: "Ú", uuml: "ü", Uuml: "Ü", ccedil: "ç", euro: "€",
+  ndash: "–", mdash: "—", hellip: "…", laquo: "«", raquo: "»",
+};
 function decodificar(t) {
-  return t.replace(/&(?:nbsp|amp|quot|apos|lt|gt|ordm|sup2|#39);/g, m => ENTIDADES[m] || " ")
-    .replace(/&#(\d+);/g, (_, n) => { try { return String.fromCharCode(Number(n)); } catch { return " "; } });
+  return String(t).replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi, (m, e) => {
+    if (e[0] === "#") {
+      const n = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      if (n === 160) return " ";
+      try { return String.fromCodePoint(n); } catch { return " "; }
+    }
+    return Object.prototype.hasOwnProperty.call(ENTIDADES, e) ? ENTIDADES[e] : m;
+  });
 }
 
 // Texto de la página: lo visible más los datos estructurados (JSON-LD y __NEXT_DATA__) que traiga
@@ -720,7 +814,7 @@ const enArgentina = (lat, lng) => lat >= ARG_LAT[0] && lat <= ARG_LAT[1] && lng 
 
 // Coordenadas, dirección y precio que la propia página declara
 function extraerDePagina(html) {
-  const out = { lat: null, lng: null, direccion: null, localidad: null, precio: null, moneda: null, titulo: null, tituloMeta: null, m2_totales: null, ambientes: null, origen: null, conAltura: false };
+  const out = { lat: null, lng: null, direccion: null, localidad: null, region: null, precio: null, moneda: null, titulo: null, tituloMeta: null, m2_totales: null, ambientes: null, dormitorios: null, banos: null, origen: null, conAltura: false };
   const h = String(html || "");
   const aNum = v => { const n = Number(String(v).replace(",", ".")); return Number.isFinite(n) ? n : null; };
   const fijar = (lat, lng, origen) => {
@@ -735,8 +829,10 @@ function extraerDePagina(html) {
     if (nodo.geo && typeof nodo.geo === "object") fijar(nodo.geo.latitude, nodo.geo.longitude, "json-ld");
     if (nodo.latitude != null && nodo.longitude != null) fijar(nodo.latitude, nodo.longitude, "json-ld");
     if (nodo.address && typeof nodo.address === "object") {
-      if (nodo.address.streetAddress && !out.direccion) out.direccion = aTexto(nodo.address.streetAddress, 120);
-      if (nodo.address.addressLocality && !out.localidad) out.localidad = aTexto(nodo.address.addressLocality, 80);
+      // streetAddress a veces trae el título del aviso: solo se guarda si es una calle con su altura
+      if (nodo.address.streetAddress && !out.direccion && pareceDireccion(nodo.address.streetAddress)) out.direccion = aTexto(nodo.address.streetAddress, 120);
+      if (nodo.address.addressLocality && !out.localidad) out.localidad = limpiarLocalidad(nodo.address.addressLocality);
+      if (nodo.address.addressRegion && !out.region) out.region = limpiarLocalidad(nodo.address.addressRegion);
     }
     if (nodo.price != null && out.precio == null) {
       out.precio = aNum(nodo.price);
@@ -745,7 +841,9 @@ function extraerDePagina(html) {
     }
     if (nodo.floorSize && typeof nodo.floorSize === "object" && out.m2_totales == null) out.m2_totales = aNum(nodo.floorSize.value);
     if (nodo.numberOfRooms != null && out.ambientes == null) out.ambientes = aNum(nodo.numberOfRooms);
-    if (nodo.name && !out.titulo && /house|apartment|residence|product|realestate|accommodation/i.test(String(nodo["@type"] || ""))) out.titulo = aTexto(nodo.name, 200);
+    if (nodo.numberOfBedrooms != null && out.dormitorios == null) out.dormitorios = aNum(nodo.numberOfBedrooms);
+    if (nodo.numberOfBathroomsTotal != null && out.banos == null) out.banos = aNum(nodo.numberOfBathroomsTotal);
+    if (nodo.name && !out.titulo && /house|apartment|residence|product|realestate|accommodation/i.test(String(nodo["@type"] || ""))) out.titulo = aTexto(limpiarTituloPagina(nodo.name), 200);
     for (const k of Object.keys(nodo)) if (typeof nodo[k] === "object") recorrer(nodo[k], prof + 1);
   };
   for (const m of h.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
@@ -779,6 +877,9 @@ function extraerDePagina(html) {
       if (out.lat != null) break;
     }
   }
+  // Zonaprop informa el barrio en la región y el partido en la localidad: "Ingeniero Maschwitz, Escobar"
+  if (out.region && out.localidad && !sinTildes(out.localidad).includes(sinTildes(out.region))) out.localidad = `${out.region}, ${out.localidad}`;
+  else if (out.region && !out.localidad) out.localidad = out.region;
   out.conAltura = !!(out.direccion && /\d/.test(out.direccion));
 
   // Título de la página (og:title o <title>), sin el nombre del sitio al final
@@ -791,9 +892,7 @@ function extraerDePagina(html) {
   }
   if (!tm) { const t = h.match(/<title[^>]*>([\s\S]*?)<\/title>/i); if (t) tm = t[1]; }
   if (tm) {
-    const completo = decodificar(tm).replace(/\s+/g, " ").trim();
-    const corto = completo.replace(/\s+[|–—]\s+[^|–—]{1,30}$/, "").replace(/\s+-\s+[^-]{1,24}$/, "").trim();
-    out.tituloMeta = aTexto(corto.length >= 8 ? corto : completo, 200);
+    out.tituloMeta = aTexto(limpiarTituloPagina(tm), 200);
   }
   return out;
 }
@@ -830,6 +929,183 @@ function superficiesDeTexto(texto) {
     }
   }
   return out;
+}
+
+// ── Ficha del aviso, leída por portal ────────────────────────
+// Cada portal muestra los datos con sus propios rótulos. Se leen por rótulo (nunca por un número suelto) y solo dentro
+// del bloque del aviso, para no tomar datos de los avisos relacionados que vienen más abajo en la misma página.
+// Lo que el aviso no publica queda vacío: no se deduce ni se completa con otra fuente.
+// Cada dato sale con la cita textual de la página, para que se pueda comparar a ojo.
+
+const ORIENTACIONES = { n: "Norte", s: "Sur", e: "Este", o: "Oeste", ne: "Noreste", no: "Noroeste", se: "Sudeste", so: "Sudoeste" };
+// Datos de la ficha que se guardan en el aviso (los m² tienen sus propios campos)
+const CAMPOS_FICHA = ["dormitorios", "banos", "ambientes", "estacionamiento", "antiguedad", "condicion", "orientacion", "disposicion", "expensas"];
+
+// Una calle con su altura ("Víctor Casteran 1500", "La Pista al 1200"), no el título de un aviso
+function pareceDireccion(s) {
+  const t = String(s || "").replace(/\s+/g, " ").trim();
+  if (t.length < 5 || t.length > 70) return false;
+  if (/\b(venta|alquiler|casa|casas|departamento|depto|lote|terreno|barrio|country|oportunidad|ambientes?|dormitorios?|m2|m²|usd|u\$s)\b/i.test(t)) return false;
+  return /^[\p{L}0-9.°ºª'’ -]{3,50}\s(?:al\s)?\d{2,5}\b/iu.test(t);
+}
+
+// "Escobar, GBA Norte, Argentina," → "Escobar"
+function limpiarLocalidad(s) {
+  const partes = String(s || "").split(",").map(x => x.trim())
+    .filter(x => x && !/^(argentina|gba\s*(norte|sur|oeste)|g\.?b\.?a\.?.*|bs\.?\s?as\.?.*|buenos aires)$/i.test(x));
+  return aTexto(partes.join(", "), 80);
+}
+
+// Título de la página sin el nombre del sitio al final ("... - Argenprop", "... | MercadoLibre")
+function limpiarTituloPagina(t) {
+  const completo = decodificar(String(t || "")).replace(/\s+/g, " ").trim();
+  const corto = completo.replace(/\s+[|–—]\s+[^|–—]{1,30}$/, "").replace(/\s+-\s+[^-]{1,24}$/, "").trim();
+  return corto.length >= 8 ? corto : completo;
+}
+
+const monedaDe = s => (/^\$$/.test(String(s).trim()) ? "ARS" : "USD");
+const montoDe = s => Number(String(s).replace(/[.,]/g, ""));
+const antiguedadDe = n => (n === 0 ? "A estrenar" : `${n} ${n === 1 ? "año" : "años"}`);
+const orientacionDe = s => ORIENTACIONES[sinTildes(s).replace(/[^a-z]/g, "")] || aTexto(s, 30);
+
+// Lee la ficha de un aviso. html puede ser null (texto pegado por el usuario); urlFinal puede ser null:
+// sin portal conocido se prueban los tres juegos de rótulos y se toma lo que cada uno encuentre.
+// Devuelve { portal, campos, superficies, precio, ubicacion, evidencia }
+function leerFicha(html, texto, urlFinal) {
+  const R = { portal: null, campos: {}, superficies: {}, precio: null, ubicacion: {}, evidencia: [] };
+  const t = String(texto || "");
+  let host = "";
+  try { host = new URL(urlFinal).hostname.replace(/^www\./, ""); } catch { /* sin link: texto pegado */ }
+  const esArg = /argenprop\./i.test(host), esZona = /zonaprop\./i.test(host), esML = /mercadolibre\.|mercadolivre\./i.test(host);
+  const todos = !esArg && !esZona && !esML;
+
+  const cita = frag => String(frag).replace(/\s+/g, " ").trim().slice(0, 90);
+  const tomar = (campo, valor, frag) => {
+    if (valor == null || valor === "" || (typeof valor === "number" && !Number.isFinite(valor))) return;
+    if (R.campos[campo] != null) return;
+    R.campos[campo] = valor;
+    if (frag) R.evidencia.push({ campo, texto: cita(frag) });
+  };
+  const tomarSup = (campo, valor, frag) => {
+    if (valor == null || !Number.isFinite(valor) || valor < 0 || valor >= 100000) return;
+    if (R.superficies[campo] != null) return;
+    R.superficies[campo] = valor;
+    if (frag) R.evidencia.push({ campo, texto: cita(frag) });
+  };
+  const enBloque = (bloque, re, campo, fn) => { const m = bloque.match(re); if (m) tomar(campo, fn(m[1]), m[0]); return m; };
+
+  // ── Argenprop: bloque oculto de la ficha y lista "Características"
+  if (esArg || todos) {
+    const ga = html ? String(html).match(/<[^>]*id=["']ga-dimension-ficha["'][^>]*>/i) : null;
+    const d = {};
+    if (ga) for (const m of ga[0].matchAll(/data-([a-z-]+)=["']([^"']*)["']/gi)) d[m[1]] = decodificar(m[2]).trim();
+    const p = Number(d.price);
+    if (p > 0 && (d.moneda === "USD" || d.moneda === "ARS")) { R.portal = "argenprop"; R.precio = { valor: p, moneda: d.moneda }; }
+    if (!R.precio) {
+      const mp = t.match(/Precio:\s*(USD|U\$S|US\$|\$)\s?(\d{1,3}(?:[.,]\d{3})+)(?![\d.,])/i);
+      if (mp && (esArg || /C[oó]digo de aviso|Tipo de operaci[oó]n/i.test(t))) { R.portal = "argenprop"; R.precio = { valor: montoDe(mp[2]), moneda: monedaDe(mp[1]) }; }
+    }
+    const iCar = t.search(/Caracter[íi]sticas\s+(?:Antig[uü]edad|Cant\.|Estado|Long\.|Expensas|Orientaci)/i);
+    if (iCar >= 0) {
+      R.portal = "argenprop";
+      const resto = t.slice(iCar);
+      const fin = resto.search(/C[oó]digo de aviso|similares|Contact[aá] al anunciante/i);
+      const bloque = resto.slice(0, fin > 0 ? Math.min(fin, 1800) : 1800);
+      // Superficies de la ficha ("Sup. Cubierta: 145 m2")
+      const supA = (re, campo) => { const m = bloque.match(re); if (m) tomarSup(campo, aM2(m[1]), m[0]); };
+      supA(/Sup\.\s*Cubierta:\s*(\d[\d.,]*)\s*m2/i, "m2_cubiertos");
+      supA(/Sup\.\s*Semicubierta:\s*(\d[\d.,]*)\s*m2/i, "m2_semicubiertos");
+      supA(/Sup\.\s*Descubierta:\s*(\d[\d.,]*)\s*m2/i, "m2_descubiertos");
+      supA(/Sup\.\s*Terreno:\s*(\d[\d.,]*)\s*m2/i, "m2_terreno");
+      supA(/Sup\.\s*Total:\s*(\d[\d.,]*)\s*m2/i, "m2_totales");
+      enBloque(bloque, /Antig[uü]edad:\s*(\d+)/i, "antiguedad", v => antiguedadDe(Number(v)));
+      enBloque(bloque, /Cant\.\s*Ba[ñn]os:\s*(\d+)/i, "banos", Number);
+      enBloque(bloque, /Cant\.\s*Dormitorios:\s*(\d+)/i, "dormitorios", Number);
+      enBloque(bloque, /Cant\.\s*Ambientes:\s*(\d+)/i, "ambientes", Number);
+      enBloque(bloque, /Cant\.\s*Cocheras:\s*(\d+)/i, "estacionamiento", Number);
+      enBloque(bloque, /Estado:\s*([^:]{2,30}?)\s+(?=Cant\.|Long\.|Expensas|Orientaci|Disposici|Datos b|Antig|$)/i, "condicion", v => aTexto(v, 40));
+      enBloque(bloque, /Orientaci[oó]n:\s*([A-Za-zÁ-ú]{1,12})/i, "orientacion", orientacionDe);
+      enBloque(bloque, /Disposici[oó]n:\s*([A-Za-zÁ-ú]{3,20})/i, "disposicion", v => aTexto(v, 30));
+      const me = bloque.match(/Expensas:\s*(\$|USD|U\$S|US\$)\s*(\d{1,3}(?:[.,]\d{3})*)/i);
+      if (me) tomar("expensas", { monto: montoDe(me[2]), moneda: monedaDe(me[1]) }, me[0]);
+      // "A estrenar" aparece en la lista principal, justo antes de "Características"
+      if (R.campos.antiguedad == null && /(?:^|\s)A estrenar(?:\s|$)/i.test(t.slice(Math.max(0, iCar - 900), iCar))) tomar("antiguedad", "A estrenar", "A estrenar");
+    }
+    if (d.dormitorios != null && d.dormitorios !== "" && Number.isFinite(Number(d.dormitorios))) tomar("dormitorios", Number(d.dormitorios), `ficha: ${d.dormitorios} dormitorios`);
+    if (R.portal === "argenprop" || esArg) {
+      const loc = [d.localidad, d.partido].map(x => (x || "").trim()).filter(Boolean).join(", ");
+      if (loc) R.ubicacion.localidad = aTexto(loc, 80);
+      if (d.barrio) R.ubicacion.barrio = aTexto(d.barrio, 60);
+    }
+  }
+
+  // ── Zonaprop: tira de iconos con abreviaturas ("244 m² cub. 6 amb. 3 baños 1 coch. 3 dorm. 50 años")
+  if (esZona || todos) {
+    const i = t.search(/\d[\d.,]*\s*m²\s*(?:tot|cub|desc|semi)\./i);
+    if (i >= 0) {
+      R.portal = "zonaprop";
+      let tira = t.slice(i, i + 320);
+      const k = tira.search(/Ver m[aá]s/i);
+      if (k > 0) tira = tira.slice(0, k);
+      const sup = (re, campo) => { const m = tira.match(re); if (m) tomarSup(campo, aM2(m[1]), m[0]); };
+      sup(/(\d[\d.,]*)\s*m²\s*tot\./i, "m2_totales");
+      sup(/(\d[\d.,]*)\s*m²\s*cub\./i, "m2_cubiertos");
+      sup(/(\d[\d.,]*)\s*m²\s*semi\w*\./i, "m2_semicubiertos");
+      sup(/(\d[\d.,]*)\s*m²\s*desc\w*\./i, "m2_descubiertos");
+      enBloque(tira, /(\d+)\s*amb\./i, "ambientes", Number);
+      enBloque(tira, /(\d+)\s*ba[ñn]os?\b/i, "banos", Number);
+      enBloque(tira, /(\d+)\s*coch\./i, "estacionamiento", Number);
+      enBloque(tira, /(\d+)\s*dorm\./i, "dormitorios", Number);
+      const ma = tira.match(/(\d+)\s*a[ñn]os\b/i);
+      if (ma) tomar("antiguedad", antiguedadDe(Number(ma[1])), ma[0]);
+      else if (/\bA estrenar\b/i.test(tira)) tomar("antiguedad", "A estrenar", "A estrenar");
+      // El precio de la propia ficha va justo antes de la tira ("... venta USD 269.000 ...")
+      if (!R.precio) {
+        const mp = t.slice(Math.max(0, i - 400), i).match(/(?:venta|alquiler)\s+(USD|U\$S|US\$|\$)\s?(\d{1,3}(?:[.,]\d{3})+)(?![\d.,])/i);
+        if (mp) R.precio = { valor: montoDe(mp[2]), moneda: monedaDe(mp[1]) };
+      }
+    }
+  }
+
+  // ── MercadoLibre: bloque "Principales" (rótulo + valor)
+  if (esML || todos) {
+    const i = t.search(/Principales\s+Superficie\s+(?:total|cubierta)/i);
+    if (i >= 0) {
+      R.portal = "mercadolibre";
+      const bloque = t.slice(i, i + 700);
+      const sup = (re, campo) => { const m = bloque.match(re); if (m) tomarSup(campo, aM2(m[1]), m[0]); };
+      sup(/Superficie total\s+(\d[\d.,]*)\s*m²/i, "m2_totales");
+      sup(/Superficie cubierta\s+(\d[\d.,]*)\s*m²/i, "m2_cubiertos");
+      sup(/Superficie semicubierta\s+(\d[\d.,]*)\s*m²/i, "m2_semicubiertos");
+      sup(/Superficie descubierta\s+(\d[\d.,]*)\s*m²/i, "m2_descubiertos");
+      sup(/Superficie (?:de|del) terreno\s+(\d[\d.,]*)\s*m²/i, "m2_terreno");
+      enBloque(bloque, /Dormitorios\s+(\d+)/i, "dormitorios", Number);
+      enBloque(bloque, /Ba[ñn]os\s+(\d+)/i, "banos", Number);
+      enBloque(bloque, /Cocheras\s+(\d+)/i, "estacionamiento", Number);
+      enBloque(bloque, /Ambientes\s+(\d+)/i, "ambientes", Number);
+      enBloque(bloque, /Antig[uü]edad\s+(\d+)\s*a[ñn]os?/i, "antiguedad", v => antiguedadDe(Number(v)));
+      enBloque(bloque, /Orientaci[oó]n\s+([A-Za-zÁ-ú]{1,12})/i, "orientacion", orientacionDe);
+      const me = bloque.match(/Expensas\s+(\d{1,3}(?:[.,]\d{3})*)\s*(ARS|USD)/i);
+      if (me) tomar("expensas", { monto: montoDe(me[1]), moneda: me[2].toUpperCase() }, me[0]);
+      if (!R.precio) {
+        const mp = t.slice(0, i).match(/(USD|U\$S|US\$)\s?(\d{1,3}(?:[.,]\d{3})+)(?![\d.,])/i);
+        if (mp) R.precio = { valor: montoDe(mp[2]), moneda: "USD" };
+      }
+      // Dirección: "Ubicación e información de la zona La Pista Al 1200, Escobar, Bs.As. G.B.A. Norte"
+      const mu = t.match(/Ubicaci[oó]n e informaci[oó]n de la zona\s+(.{3,160}?),\s*Bs\.?\s?As\./i);
+      if (mu) {
+        const partes = mu[1].split(",").map(x => x.trim()).filter(Boolean);
+        if (partes.length && pareceDireccion(partes[0])) R.ubicacion.direccion = aTexto(partes[0], 120);
+        if (partes.length) R.ubicacion.localidad = aTexto(partes[partes.length - 1], 80);
+      }
+    }
+  }
+  return R;
+}
+
+// Ficha a partir de un texto pegado (sin HTML ni link). Solo toma lo que el texto dice con su rótulo.
+function leerFichaDeTexto(texto) {
+  return leerFicha(null, String(texto || "").replace(/\s+/g, " "), null);
 }
 
 const MOTIVOS_ERROR = {
@@ -978,6 +1254,12 @@ function confirmarCampos(a, pagina, texto) {
   if (a.tipo && !norm.includes(sinTildes(a.tipo))) anular.push("tipo");
   if (!pg.ambientes && a.ambientes && !new RegExp(`(?:^|[^0-9])${a.ambientes}\\s*(?:amb|ambientes)\\b`).test(norm)) anular.push("ambientes");
   const caracteristicas = (a.caracteristicas || []).filter(c => norm.includes(sinTildes(c)));
+  // Citas de los datos de la ficha (dormitorios, baños, antigüedad, etc.); las superficies y el precio ya tienen la suya
+  const yaTienen = new Set(evidencia.map(e => e.campo));
+  for (const e of pg.ficha?.evidencia || []) {
+    if (!yaTienen.has(e.campo)) { evidencia.push(e); yaTienen.add(e.campo); }
+    else if (CAMPOS_M2.includes(e.campo)) evidencia[evidencia.findIndex(x => x.campo === e.campo)] = e; // la cita de la ficha es más precisa
+  }
   return { evidencia, anular, caracteristicas };
 }
 
@@ -1057,7 +1339,14 @@ async function verificarAviso(a, cache = new Map()) {
   if (portada) return { estado: "no_legible", motivo: portada };
 
   const pagina = extraerDePagina(r.html);
-  pagina.superficies = superficiesDeTexto(texto);
+  // Ficha por portal (Argenprop, Zonaprop, MercadoLibre): precio, superficies y datos del aviso con su cita textual
+  const ficha = leerFicha(r.html, texto, r.url);
+  pagina.ficha = ficha;
+  pagina.superficies = { ...superficiesDeTexto(texto), ...ficha.superficies };
+  if (!(pagina.precio > 0) && ficha.precio) { pagina.precio = ficha.precio.valor; pagina.moneda = ficha.precio.moneda; }
+  if (!pagina.direccion && ficha.ubicacion.direccion) { pagina.direccion = ficha.ubicacion.direccion; pagina.conAltura = /\d/.test(pagina.direccion); }
+  if (ficha.ubicacion.localidad) pagina.localidad = ficha.ubicacion.localidad;
+  if (ficha.ubicacion.barrio) pagina.barrio = ficha.ubicacion.barrio;
   // Si la página declara su precio de forma estructurada (JSON-LD) y no es un listado, el aviso existe y sus datos
   // salen de ahí, aunque el modelo los haya leído distinto.
   const precioEstructurado = pagina.precio > 0 && (pagina.moneda === "USD" || pagina.moneda === "ARS");
@@ -1113,7 +1402,7 @@ async function verificarAvisos(avisos, cache = new Map()) {
 // Guarda en el aviso el resultado de la verificación. Si el aviso se verificó, los datos que la propia página
 // muestra (precio, superficies, ubicación) reemplazan a los del modelo, lo que la página no confirma se quita
 // y se recalcula el USD/m². Devuelve el aviso (nuevo, ya recalculado).
-function aplicarVerificacion(a, v) {
+function aplicarVerificacion(a, v, { releer = false } = {}) {
   const pg = v.pagina;
   const nuevo = { ...a, verificacion: { estado: v.estado, motivo: v.motivo || null } };
   const dePagina = [];
@@ -1134,6 +1423,8 @@ function aplicarVerificacion(a, v) {
       if (valor != null && nuevo[campo] !== valor) { nuevo[campo] = valor; dePagina.push(campo); }
     }
     if (!nuevo.ambientes && pg.ambientes) nuevo.ambientes = pg.ambientes;
+    if (!nuevo.dormitorios && pg.dormitorios != null && !pg.ficha?.campos?.dormitorios) nuevo.dormitorios = pg.dormitorios;
+    if (!nuevo.banos && pg.banos != null && !pg.ficha?.campos?.banos) nuevo.banos = pg.banos;
     const titulo = pg.titulo || pg.tituloMeta;
     if (titulo) nuevo.titulo = titulo;
     if (a.solo_pagina && pg.tipo) nuevo.tipo = pg.tipo;
@@ -1142,8 +1433,29 @@ function aplicarVerificacion(a, v) {
       nuevo.ubic_precision = pg.conAltura ? "exacta" : "calle";
       nuevo.ubic_origen = "pagina";
     }
-    if (!nuevo.direccion && pg.direccion) nuevo.direccion = pg.direccion;
-    if (!nuevo.localidad && pg.localidad) nuevo.localidad = pg.localidad;
+    // Al leer de nuevo la página (o en avisos que el servidor leyó por su cuenta) lo que la página muestra pisa lo anterior;
+    // en los que escribió el modelo solo se completa lo vacío
+    const manda = a.solo_pagina || releer;
+    if (pg.direccion && (manda || !nuevo.direccion)) nuevo.direccion = pg.direccion;
+    if (pg.localidad && (manda || !nuevo.localidad)) nuevo.localidad = pg.localidad;
+    if (pg.barrio && (manda || !nuevo.barrio)) nuevo.barrio = pg.barrio;
+
+    // Datos de la ficha de cada portal, con su origen. Lo cargado a mano no se pisa.
+    const origen = { ...(a.origen_campos || {}) };
+    const fi = pg.ficha;
+    if (fi) {
+      for (const c of CAMPOS_FICHA) {
+        if (fi.campos[c] == null || origen[c] === "manual") continue;
+        nuevo[c] = fi.campos[c];
+        origen[c] = "pagina";
+      }
+    }
+    for (const c of ["precio", ...CAMPOS_M2, "direccion", "localidad", "barrio", "ambientes"]) {
+      if (origen[c] === "manual") continue;
+      const sale = c === "precio" ? pg.precio > 0 : CAMPOS_M2.includes(c) ? (pg.superficies?.[c] != null || (c === "m2_totales" && pg.m2_totales)) : c === "ambientes" ? (pg.ambientes || fi?.campos?.ambientes != null) : !!pg[c];
+      if (sale) origen[c] = "pagina";
+    }
+    if (Object.keys(origen).length) nuevo.origen_campos = origen;
   }
   // El nombre del portal sale del dominio del link, no de lo que diga el modelo
   if (nuevo.link) nuevo.fuente = fuenteDeLink(nuevo.link) || nuevo.fuente;
@@ -1267,6 +1579,219 @@ async function tokkoPagina(key, offset) {
 }
 
 // ── Módulo ───────────────────────────────────────────────────
+
+// ── Completar y corregir avisos ya guardados ─────────────────
+// Tres vías, todas con su origen marcado (origen_campos): volver a leer la página, leer un texto pegado y cargar a mano.
+// Lo cargado a mano no se pisa nunca; si el aviso tenía un valor distinto, queda en "originales" para verlo.
+const EDITABLES = {
+  precio: "precio", moneda: "moneda",
+  m2_cubiertos: "m2", m2_terreno: "m2", m2_totales: "m2", m2_semicubiertos: "m2c", m2_descubiertos: "m2c", m2_balcon: "m2c",
+  dormitorios: "ent", banos: "ent", estacionamiento: "ent", ambientes: "ent",
+  antiguedad: "ant", condicion: "t40", orientacion: "t30", disposicion: "t30", expensas: "exp",
+  direccion: "t120", barrio: "t60", localidad: "t80", tipo: "t60",
+};
+
+function convertirCampo(campo, valor) {
+  const tipo = EDITABLES[campo];
+  if (!tipo) return { error: "ese dato no se puede editar" };
+  if (valor === null || valor === "") return { valor: null };
+  switch (tipo) {
+    case "precio": { const n = aNumero(valor); return n ? { valor: n } : { error: "el precio tiene que ser un número mayor que 0" }; }
+    case "moneda": return valor === "USD" || valor === "ARS" ? { valor } : { error: "la moneda es USD o ARS" };
+    case "m2": { const n = aNumero(valor); return n && n < 100000 ? { valor: n } : { error: "la superficie tiene que ser un número mayor que 0" }; }
+    case "m2c": { const n = aNumeroOCero(valor); return n != null && n < 100000 ? { valor: n } : { error: "la superficie tiene que ser un número (0 si no tiene)" }; }
+    case "ent": { const n = aEnteroHasta(valor, 30); return n != null ? { valor: n } : { error: "tiene que ser un número entero entre 0 y 30" }; }
+    case "ant": {
+      const s = String(valor).trim();
+      if (/^\d{1,3}$/.test(s)) return { valor: antiguedadDe(Number(s)) };
+      const t = aTexto(s, 40);
+      return t ? { valor: t } : { error: "antigüedad inválida" };
+    }
+    case "exp": { const e = aExpensas(valor); return e ? { valor: e } : { error: "las expensas llevan monto y moneda (ARS o USD)" }; }
+    default: { const t = aTexto(valor, Number(tipo.slice(1))); return t ? { valor: t } : { error: "texto inválido" }; }
+  }
+}
+
+const mismoValor = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+
+// Aplica cambios a un aviso y lo vuelve a normalizar (superficie homologada, USD/m², advertencias y faltantes)
+function renormalizar(crudo, id) {
+  const [rec] = normalizarAvisos([crudo], null);
+  if (rec) rec.id = id; // el id no cambia aunque cambie el precio de un aviso sin link
+  return rec;
+}
+
+// Carga manual. confirmar: true → el tasador da por buenos los datos (habilita incluir un aviso sin verificar); false → lo retira.
+function aplicarCambiosManuales(a, cambios, { confirmar } = {}) {
+  const errores = [];
+  const nuevos = {};
+  for (const [campo, v] of Object.entries(cambios || {})) {
+    const r = convertirCampo(campo, v);
+    if (r.error) errores.push({ campo, motivo: r.error }); else nuevos[campo] = r.valor;
+  }
+  if (nuevos.precio != null && !("moneda" in nuevos) && !a.moneda) errores.push({ campo: "moneda", motivo: "indicá la moneda del precio (USD o ARS)" });
+  if (!Object.keys(nuevos).length && typeof confirmar !== "boolean" && !errores.length) errores.push({ campo: null, motivo: "no hay nada para cambiar" });
+  if (errores.length) return { errores };
+
+  const crudo = { ...a };
+  const origen = { ...(a.origen_campos || {}) };
+  const originales = { ...(a.originales || {}) };
+  const cambiados = [];
+  for (const [campo, valor] of Object.entries(nuevos)) {
+    const antes = a[campo] ?? null;
+    if (mismoValor(antes, valor)) continue;
+    if (antes != null && originales[campo] === undefined && origen[campo] !== "manual") originales[campo] = antes;
+    crudo[campo] = valor;
+    origen[campo] = "manual";
+    cambiados.push({ campo, antes, despues: valor });
+  }
+  if (cambiados.length) crudo.editado_a_mano = true;
+  if (confirmar === true) crudo.confirmado_a_mano = true;
+  if (confirmar === false) delete crudo.confirmado_a_mano;
+  crudo.origen_campos = origen;
+  crudo.originales = originales;
+  return { aviso: renormalizar(crudo, a.id), cambios: cambiados };
+}
+
+// Texto pegado (copiado de la publicación): solo se toma lo que el texto dice con su rótulo. Lo cargado a mano no se pisa.
+function aplicarFichaTexto(a, texto) {
+  const f = leerFichaDeTexto(texto);
+  const crudo = { ...a };
+  const origen = { ...(a.origen_campos || {}) };
+  const originales = { ...(a.originales || {}) };
+  const cambiados = [];
+  const poner = (campo, valor) => {
+    if (valor == null || origen[campo] === "manual") return;
+    const antes = a[campo] ?? null;
+    if (mismoValor(antes, valor)) return;
+    if (antes != null && originales[campo] === undefined) originales[campo] = antes;
+    crudo[campo] = valor;
+    origen[campo] = "texto_pegado";
+    cambiados.push({ campo, antes, despues: valor });
+  };
+  if (f.precio) { poner("precio", f.precio.valor); poner("moneda", f.precio.moneda); }
+  for (const [c, v] of Object.entries(f.superficies)) poner(c, v);
+  for (const c of CAMPOS_FICHA) poner(c, f.campos[c]);
+  for (const c of ["direccion", "barrio", "localidad"]) poner(c, f.ubicacion[c]);
+  if (cambiados.length) {
+    const citas = f.evidencia.filter(e => cambiados.some(x => x.campo === e.campo));
+    const resto = (a.evidencia || []).filter(e => !citas.some(c => c.campo === e.campo));
+    crudo.evidencia = [...resto, ...citas];
+  }
+  crudo.origen_campos = origen;
+  crudo.originales = originales;
+  const rec = renormalizar(crudo, a.id);
+  return { aviso: rec, cambios: cambiados, encontrados: Object.keys({ ...f.campos, ...f.superficies, ...(f.precio ? { precio: 1 } : {}) }) };
+}
+
+// Después de volver a leer la página: lo que la página muestra pisa lo anterior, salvo lo cargado a mano
+// (que se conserva y deja el valor de la página en "originales" para compararlo).
+function aplicarReLectura(a, v) {
+  const leido = aplicarVerificacion(a, v, { releer: true });
+  const crudo = { ...leido };
+  const origen = { ...(leido.origen_campos || {}) };
+  const originales = { ...(a.originales || {}) };
+  for (const [campo, o] of Object.entries(a.origen_campos || {})) {
+    if (o !== "manual") continue;
+    if (leido[campo] != null && !mismoValor(leido[campo], a[campo])) originales[campo] = leido[campo];
+    crudo[campo] = a[campo];
+    origen[campo] = "manual";
+  }
+  if (a.editado_a_mano) crudo.editado_a_mano = true;
+  if (a.confirmado_a_mano) crudo.confirmado_a_mano = true;
+  crudo.origen_campos = origen;
+  if (Object.keys(originales).length) crudo.originales = originales;
+  return renormalizar(crudo, a.id);
+}
+
+// Qué cambió entre dos versiones de un aviso (solo los datos que se muestran)
+const CAMPOS_COMPARABLES = ["precio", "moneda", "m2_cubiertos", "m2_semicubiertos", "m2_descubiertos", "m2_balcon", "m2_terreno", "m2_totales",
+  "dormitorios", "banos", "estacionamiento", "ambientes", "antiguedad", "condicion", "orientacion", "disposicion", "expensas", "direccion", "barrio", "localidad"];
+function diferencias(antes, despues) {
+  return CAMPOS_COMPARABLES.filter(c => !mismoValor(antes[c], despues[c])).map(c => ({ campo: c, antes: antes[c] ?? null, despues: despues[c] ?? null }));
+}
+
+// ── Avisos para el módulo de Tasaciones ──────────────────────
+// Un aviso puede sumarse al cálculo de una tasación si tiene precio en USD, superficie cubierta (en lotes, de terreno)
+// y su link se verificó o el tasador confirmó sus datos. Nunca entra solo: lo elige el tasador.
+function motivosNoElegible(a) {
+  const m = [];
+  if (!a.precio) m.push("no tiene precio");
+  else if (a.moneda === "ARS") m.push("está publicado en pesos");
+  else if (a.moneda !== "USD") m.push("no tiene moneda");
+  if (!a.m2_homologados) m.push(/lote|terreno/.test(sinTildes(a.tipo || "")) ? "no tiene superficie de terreno" : "no tiene superficie cubierta");
+  if (!(a.verificacion?.estado === "verificado" || a.confirmado_a_mano)) m.push("no se pudo verificar el link: falta que el tasador confirme los datos");
+  return m;
+}
+
+function tipoATipologia(tipo) {
+  const t = sinTildes(tipo || "");
+  if (/lote|terreno/.test(t)) return "Terreno";
+  if (/local/.test(t)) return "Local";
+  if (/oficina/.test(t)) return "Oficina";
+  if (/\bph\b|duplex|triplex/.test(t)) return "PH";
+  if (/depart|loft|monoamb/.test(t)) return "Departamento";
+  if (/casa|quinta|chalet|chacra|campo|villa/.test(t)) return "Casa";
+  return aTexto(tipo, 30) || "";
+}
+
+// Mismo esquema que tokkoToProp (textos con números), para que Tasaciones lo use como cualquier comparable
+function avisoATasacion(a) {
+  const num = n => (n != null && Number.isFinite(n) ? String(Math.round(n * 100) / 100) : "");
+  const lote = /lote|terreno/.test(sinTildes(a.tipo || ""));
+  const mAnt = a.antiguedad ? (/estrenar/i.test(a.antiguedad) ? "0" : (String(a.antiguedad).match(/\d+/) || [""])[0]) : "";
+  const motivos = motivosNoElegible(a);
+  const avisos = [];
+  if (a.atipico) avisos.push("su precio por m² está muy fuera de lo habitual en la zona");
+  if (a.base_m2 === "homologada_parcial") avisos.push("solo publica la superficie cubierta");
+  if (a.editado_a_mano) avisos.push("tiene datos cargados a mano");
+  return {
+    id: `web_${a.id}`,
+    aviso_id: a.id,
+    origen: "publicacion_web",
+    sin_calificar: true,
+    titulo: a.titulo,
+    direccion: a.direccion || "",
+    barrio: a.barrio || a.localidad || "",
+    tipologia: tipoATipologia(a.tipo),
+    precio: a.precio && a.moneda === "USD" ? String(Math.round(a.precio)) : "",
+    // En lotes la superficie base es la del terreno; Tasaciones solo suma supCubierta y las aperturas
+    supCubierta: lote ? num(a.m2_terreno ?? a.m2_totales) : num(a.m2_cubiertos),
+    supSemicubierta: lote ? "" : num(a.m2_semicubiertos),
+    supDescubierta: lote ? "" : num(a.m2_descubiertos),
+    supBalcon: lote ? "" : num(a.m2_balcon),
+    supTotal: num(a.m2_totales),
+    terreno: num(a.m2_terreno),
+    antiguedad: mAnt,
+    dormitorios: a.dormitorios != null ? String(a.dormitorios) : "",
+    ambientes: a.ambientes != null ? String(a.ambientes) : "",
+    banos: a.banos != null ? String(a.banos) : "",
+    estacionamiento: a.estacionamiento != null ? String(a.estacionamiento) : "",
+    orientacion: a.orientacion || "",
+    condicion: a.condicion || "",
+    disposicion: a.disposicion || "",
+    qualifications: defQuals(),
+    link: a.link || null,
+    fuente: a.fuente || "",
+    lat: a.lat ?? null,
+    lng: a.lng ?? null,
+    m2_homologados: a.m2_homologados,
+    usd_m2: a.usd_m2,
+    atipico: !!a.atipico,
+    verificado: a.verificacion?.estado === "verificado",
+    confirmado_a_mano: !!a.confirmado_a_mano,
+    editado_a_mano: !!a.editado_a_mano,
+    origen_campos: a.origen_campos || {},
+    originales: a.originales || {},
+    faltantes: a.faltantes || [],
+    faltantes_opc: a.faltantes_opc || [],
+    completitud: a.completitud ?? null,
+    evidencia: a.evidencia || [],
+    elegible: motivos.length === 0,
+    motivos_no_elegible: motivos,
+    advertencias: avisos,
+  };
+}
 
 module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anthropic }) {
   const router = express.Router();
@@ -1761,6 +2286,147 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
     }
   });
 
+  // ── Completar y corregir avisos guardados, y pasarlos a Tasaciones ──
+  const MAX_COMPLETAR_POR_HORA = Number(process.env.COMPARABLES_COMPLETAR_POR_HORA || 60);
+  const MAX_AVISOS_COMPLETAR = 12;
+  const MAX_TEXTO_PEGADO = 20000;
+  const excedeLimiteCompletar = crearLimite(MAX_COMPLETAR_POR_HORA);
+  const idSimple = v => (typeof v === "string" || typeof v === "number") && /^[\w-]{1,64}$/.test(String(v));
+
+  async function leerBusqueda(tenant_id, busqueda_id) {
+    const filas = await sbQuery(
+      "comparables_busquedas",
+      `tenant_id=eq.${tenant_id}&id=eq.${encodeURIComponent(String(busqueda_id))}&select=id,data,created_at`
+    );
+    const fila = filas?.[0];
+    return fila && Array.isArray(fila.data?.resultado?.avisos) ? fila : null;
+  }
+
+  // Guarda los avisos y recalcula las estadísticas (cuentan los que el tasador confirmó o completó)
+  async function guardarAvisos(tenant_id, fila, avisos) {
+    const estadisticas = calcularEstadisticas(avisos);
+    const data = { ...fila.data, resultado: { ...fila.data.resultado, avisos, estadisticas } };
+    await sbPatch("comparables_busquedas", `id=eq.${encodeURIComponent(String(fila.id))}&tenant_id=eq.${tenant_id}`, { data });
+    return estadisticas;
+  }
+
+  // modo "pagina": vuelve a leer el link (de 1 a 12 avisos) · "texto": lee un texto pegado · "manual": carga o corrige a mano
+  // No repite la búsqueda ni usa búsquedas web: no gasta tokens.
+  router.post("/historial/completar", async (req, res) => {
+    try {
+      const { tenant_id, busqueda_id, aviso_id, aviso_ids, modo, texto, campos, confirmar } = req.body || {};
+      if (!tenant_id || !UUID_RE.test(tenant_id)) return res.status(400).json({ error: "Falta tenant_id" });
+      if (!idSimple(busqueda_id)) return res.status(400).json({ error: "Falta la búsqueda guardada" });
+      if (!["pagina", "texto", "manual"].includes(modo)) return res.status(400).json({ error: "El modo tiene que ser pagina, texto o manual" });
+
+      const fila = await leerBusqueda(tenant_id, busqueda_id);
+      if (!fila) return res.status(404).json({ error: "No se encontró la búsqueda guardada" });
+      const avisos = fila.data.resultado.avisos;
+
+      if (modo === "pagina") {
+        const ids = [...new Set((Array.isArray(aviso_ids) ? aviso_ids : [aviso_id]).filter(idSimple).map(String))];
+        if (!ids.length || ids.length > MAX_AVISOS_COMPLETAR) {
+          return res.status(400).json({ error: `Mandá entre 1 y ${MAX_AVISOS_COMPLETAR} avisos por llamada` });
+        }
+        const objetivos = ids.map(id => avisos.find(a => a.id === id)).filter(Boolean);
+        if (!objetivos.length) return res.status(404).json({ error: "No se encontraron esos avisos en la búsqueda" });
+        if (excedeLimiteCompletar(tenant_id, objetivos.length)) {
+          return res.status(429).json({ error: "Llegaste al límite de lecturas de páginas por hora. Probá más tarde." });
+        }
+        const lecturas = await verificarAvisos(objetivos, new Map());
+        const informe = [];
+        objetivos.forEach((a, k) => {
+          const v = lecturas[k];
+          if (v.estado !== "verificado") {
+            informe.push({ aviso_id: a.id, actualizado: false, estado: v.estado, motivo: v.motivo || "no se pudo abrir el link" });
+            return;
+          }
+          const nuevo = aplicarReLectura(a, v);
+          avisos[avisos.findIndex(x => x.id === a.id)] = nuevo;
+          informe.push({ aviso_id: a.id, actualizado: true, cambios: diferencias(a, nuevo), faltantes: nuevo.faltantes });
+        });
+        const estadisticas = await guardarAvisos(tenant_id, fila, avisos);
+        return res.json({ modo, informe, avisos: avisos.filter(a => ids.includes(a.id)), estadisticas });
+      }
+
+      if (!idSimple(aviso_id)) return res.status(400).json({ error: "Falta el aviso" });
+      const pos = avisos.findIndex(a => a.id === String(aviso_id));
+      if (pos < 0) return res.status(404).json({ error: "No se encontró ese aviso en la búsqueda" });
+      const a = avisos[pos];
+
+      let r;
+      if (modo === "texto") {
+        const t = typeof texto === "string" ? texto.trim() : "";
+        if (t.length < 20) return res.status(400).json({ error: "Pegá el texto de la publicación (con la ficha: superficie, dormitorios, antigüedad, etc.)" });
+        if (t.length > MAX_TEXTO_PEGADO) return res.status(400).json({ error: "El texto es demasiado largo" });
+        r = aplicarFichaTexto(a, t);
+      } else {
+        if (campos != null && (typeof campos !== "object" || Array.isArray(campos))) return res.status(400).json({ error: "Los datos a cargar tienen que ser un objeto" });
+        r = aplicarCambiosManuales(a, campos || {}, { confirmar: typeof confirmar === "boolean" ? confirmar : undefined });
+        if (r.errores) return res.status(400).json({ error: "Hay datos inválidos", errores: r.errores });
+      }
+      avisos[pos] = r.aviso;
+      const estadisticas = await guardarAvisos(tenant_id, fila, avisos);
+      res.json({
+        modo,
+        aviso: r.aviso,
+        cambios: r.cambios,
+        ...(modo === "texto" ? {
+          encontrados: r.encontrados,
+          mensaje: r.cambios.length ? null : "No encontré datos con rótulos conocidos en ese texto (por ejemplo \"Dormitorios: 3\", \"Antigüedad: 5\" o \"145 m² cub.\"). Probá copiando también la ficha de la publicación.",
+        } : {}),
+        estadisticas,
+      });
+    } catch (err) {
+      console.error("[comparables] completar:", err);
+      res.status(500).json({ error: "No se pudo completar el aviso", detalle: err.message });
+    }
+  });
+
+  // Para el módulo de Tasaciones: los avisos de la búsqueda guardada de una propiedad, ya en el esquema de Tasaciones.
+  // Sin busqueda_id devuelve la más reciente de esa propiedad; siempre incluye la fecha y la lista de búsquedas disponibles.
+  router.get("/para-tasacion", async (req, res) => {
+    try {
+      const { tenant_id, propiedad_id, busqueda_id } = req.query;
+      if (!tenant_id || !UUID_RE.test(tenant_id)) return res.status(400).json({ error: "Falta tenant_id" });
+      if (!idSimple(propiedad_id) && !idSimple(busqueda_id)) return res.status(400).json({ error: "Falta propiedad_id o busqueda_id" });
+      const filas = await sbQuery(
+        "comparables_busquedas",
+        `tenant_id=eq.${tenant_id}&select=id,data,created_at&order=created_at.desc&limit=100`
+      );
+      const dias = f => Math.max(0, Math.floor((Date.now() - new Date(f.created_at).getTime()) / 86400000));
+      const deLaPropiedad = idSimple(propiedad_id)
+        ? filas.filter(f => String(f.data?.parametros?.propiedad_id ?? "") === String(propiedad_id))
+        : filas;
+      const elegida = idSimple(busqueda_id) ? filas.find(f => String(f.id) === String(busqueda_id)) : deLaPropiedad[0];
+      const busquedas = deLaPropiedad.map(f => ({
+        id: f.id, fecha: f.created_at, hace_dias: dias(f), zona: f.data?.parametros?.zona || null, tipo: f.data?.parametros?.tipo || null,
+        avisos: Array.isArray(f.data?.resultado?.avisos) ? f.data.resultado.avisos.length : 0, grupo: f.data?.grupo || null,
+      }));
+      if (!elegida || !Array.isArray(elegida.data?.resultado?.avisos)) {
+        return res.json({ busqueda: null, busquedas, avisos: [], estadisticas: null, resumen: { total: 0, elegibles: 0, no_elegibles: 0 } });
+      }
+      const guardados = elegida.data.resultado.avisos;
+      const conDatos = guardados.map(a => (a.faltantes ? a : { ...a, ...completitudDe(a) })); // búsquedas viejas, sin los campos nuevos
+      const estadisticas = calcularEstadisticas(conDatos.map(a => ({ ...a })));
+      const avisos = conDatos.map(avisoATasacion);
+      const p = elegida.data.parametros || {};
+      res.json({
+        busqueda: {
+          id: elegida.id, fecha: elegida.created_at, hace_dias: dias(elegida), zona: p.zona || null, tipo: p.tipo || null,
+          propiedad_id: p.propiedad_id ?? null, m2: p.m2 ?? null, ambientes: p.ambientes ?? null,
+        },
+        busquedas,
+        estadisticas,
+        avisos,
+        resumen: { total: avisos.length, elegibles: avisos.filter(a => a.elegible).length, no_elegibles: avisos.filter(a => !a.elegible).length },
+      });
+    } catch (err) {
+      console.error("[comparables] para-tasacion:", err);
+      res.status(500).json({ error: "No se pudo leer la búsqueda para Tasaciones", detalle: err.message });
+    }
+  });
+
   return { router };
 };
 
@@ -1774,4 +2440,6 @@ module.exports._internals = {
   quitarDuplicados, limpiarSalidaModelo, esIpPrivada, hostSeguro, costoEstimado, preciosDeModelo,
   recolectarResultados, pareceUrlDeAviso, fuenteDeLink, esPortadaDisfrazada, buscarNumero, precioUnicoEnTexto,
   confirmarCampos, extraerLinksDeAvisos, candidatosDeResultados, tipoDeTitulo, leerPaginaUnaVez,
+  decodificar, leerFicha, leerFichaDeTexto, pareceDireccion, limpiarLocalidad, limpiarTituloPagina, completitudDe, datosDelAviso,
+  convertirCampo, aplicarCambiosManuales, aplicarFichaTexto, aplicarReLectura, diferencias, motivosNoElegible, tipoATipologia, avisoATasacion,
 };
