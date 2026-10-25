@@ -140,6 +140,65 @@ function parsearJson(texto) {
   return JSON.parse(limpio.slice(a, b + 1));
 }
 
+// Objetos JSON completos (llaves balanceadas, respetando textos entre comillas) que aparecen dentro de un texto.
+// Sirve cuando el modelo escribe comentarios antes o después del JSON, o cuando la respuesta quedó cortada.
+function objetosJson(texto) {
+  const out = [];
+  let i = 0;
+  while (i < texto.length) {
+    if (texto[i] !== "{") { i++; continue; }
+    let prof = 0, enTexto = false, esc = false, j = i, cerro = false;
+    for (; j < texto.length; j++) {
+      const c = texto[j];
+      if (enTexto) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') enTexto = false;
+        continue;
+      }
+      if (c === '"') enTexto = true;
+      else if (c === "{") prof++;
+      else if (c === "}") { prof--; if (prof === 0) { cerro = true; break; } }
+    }
+    if (cerro) { out.push(texto.slice(i, j + 1)); i = j + 1; } else { i++; }
+  }
+  return out;
+}
+
+// Lee la respuesta del modelo con tolerancia. `textos` son los bloques de texto (el último primero).
+// Devuelve { parsed, recuperado }: recuperado = true si hubo que rescatar los avisos de una respuesta cortada.
+// Si no hay forma de leerla, lanza un Error.
+function parsearRespuestaModelo(textos) {
+  const lista = (Array.isArray(textos) ? textos : [textos]).filter(t => typeof t === "string" && t.trim());
+  const candidatos = [...lista, lista.join("\n")];
+  for (const t of candidatos) {
+    const limpio = t.replace(/```json|```/g, "");
+    // Prefiere el objeto más grande que tenga la lista de avisos
+    const validos = [];
+    for (const o of objetosJson(limpio)) {
+      try {
+        const p = JSON.parse(o);
+        if (p && typeof p === "object" && Array.isArray(p.avisos)) validos.push({ p, largo: o.length });
+      } catch { /* no era JSON: sigue */ }
+    }
+    if (validos.length) {
+      validos.sort((x, y) => y.largo - x.largo);
+      return { parsed: validos[0].p, recuperado: false };
+    }
+  }
+  // Respuesta cortada: se rescatan los avisos que quedaron completos
+  for (const t of candidatos) {
+    const m = /"avisos"\s*:\s*\[/.exec(t);
+    if (!m) continue;
+    const avisos = [];
+    for (const o of objetosJson(t.slice(m.index + m[0].length))) {
+      try { const a = JSON.parse(o); if (a && typeof a === "object") avisos.push(a); } catch { /* aviso roto: se omite */ }
+    }
+    if (avisos.length) return { parsed: { avisos, hay_mas: true, notas: "La respuesta del modelo llegó cortada: se muestran los avisos que alcanzaron a completarse." }, recuperado: true };
+  }
+  throw new Error("La respuesta no contiene JSON de avisos");
+}
+
 // Número positivo o null. Acepta number o string ("1.250.000", "85,5").
 function aNumero(v) {
   if (v === null || v === undefined || v === "") return null;
@@ -1930,8 +1989,13 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
       vueltas += 1;
     }
 
+    const textosFinal = resp.content.filter(b => b.type === "text").map(b => b.text);
+    const textosTodos = bloques.filter(b => b.type === "text").map(b => b.text);
     return {
-      texto: resp.content.filter(b => b.type === "text").map(b => b.text).join("\n"),
+      texto: textosFinal.join("\n"),
+      // El último bloque primero: es donde el modelo pone el JSON. Después los demás, por si lo dejó en otro.
+      textos: [...textosFinal].reverse().concat(textosTodos.filter(t => !textosFinal.includes(t)).reverse()),
+      stop_reason: resp.stop_reason || null,
       urlsVistas: recolectarUrls(bloques),
       resultadosWeb: recolectarResultados(bloques),
       busquedasWeb: uso.busquedas || bloques.filter(b => b.type === "server_tool_use").length,
@@ -1982,13 +2046,26 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
         return res.status(429).json({ error: `Llegaste al límite de ${MAX_POR_DIA_Y_TENANT} búsquedas por día. Probá mañana.` });
       }
 
-      const { texto, urlsVistas, resultadosWeb, busquedasWeb, uso } = await buscarConClaude(params, previosN);
+      const { texto, textos, stop_reason, urlsVistas, resultadosWeb, busquedasWeb, uso } = await buscarConClaude(params, previosN);
 
+      // Lectura tolerante de lo que contestó el modelo. Si no se puede leer, la búsqueda sigue con lo que el servidor
+      // encuentre por su cuenta en los resultados (listados y páginas de avisos), que no depende del modelo.
       let parsed;
+      let respuestaIlegible = false;
       try {
-        parsed = parsearJson(texto);
-      } catch {
-        return res.status(502).json({ error: "No pude interpretar la respuesta de la búsqueda. Probá de nuevo." });
+        const lectura = parsearRespuestaModelo(textos);
+        parsed = lectura.parsed;
+        if (lectura.recuperado) console.warn(`[comparables] buscar: respuesta cortada (stop_reason=${stop_reason}); se rescataron ${parsed.avisos.length} avisos`);
+      } catch (e) {
+        respuestaIlegible = true;
+        // Queda registro de qué devolvió el modelo (antes este error no dejaba ninguna pista en el log)
+        console.error(
+          `[comparables] buscar: no pude leer la respuesta del modelo (${e.message}). stop_reason=${stop_reason}, ` +
+          `${textos.length} bloques de texto, ${texto.length} caracteres, ${uso.output_tokens} tokens de salida, ` +
+          `${busquedasWeb} búsquedas web, ${resultadosWeb?.length ?? "?"} resultados web. ` +
+          `Inicio: ${JSON.stringify(texto.slice(0, 300))} … Final: ${JSON.stringify(texto.slice(-300))}`
+        );
+        parsed = { avisos: [], hay_mas: false, notas: "" };
       }
 
       const idsPrevios = new Set(previosN.map(a => a.id));
@@ -2049,7 +2126,17 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
       const verificados = avisos.filter(a => a.verificacion?.estado === "verificado").length;
       const sinVerificar = avisos.filter(a => a.verificacion && a.verificacion.estado !== "verificado").length;
 
-      const nota = typeof parsed.notas === "string" ? parsed.notas : "";
+      if (respuestaIlegible && !nuevos.length) {
+        const motivo = stop_reason === "max_tokens" ? "la respuesta se cortó por ser demasiado larga"
+          : stop_reason === "pause_turn" ? "la búsqueda quedó a mitad de camino"
+          : "el modelo no devolvió los avisos en el formato esperado";
+        return res.status(502).json({
+          error: "No pude interpretar la respuesta de la búsqueda. Probá de nuevo.",
+          detalle: `${motivo} (${stop_reason || "sin motivo de corte"}); no se encontraron avisos por otra vía. Si se repite, probá con una zona más acotada.`,
+        });
+      }
+      const nota = (typeof parsed.notas === "string" ? parsed.notas : "") ||
+        (respuestaIlegible ? "El modelo no devolvió datos legibles: se muestran solo los avisos que el servidor leyó por su cuenta de las páginas de los portales." : "");
       const duracion = Date.now() - inicio;
       const sinLink = nuevos.filter(a => !a.link).length;
       console.log(
@@ -2432,7 +2519,7 @@ module.exports = function crearModuloComparables({ SB_URL, SB_KEY, sbQuery, anth
 
 // Solo para tests locales
 module.exports._internals = {
-  armarPrompt, parsearJson, aNumero, normalizarAvisos, calcularEstadisticas, percentil,
+  armarPrompt, parsearJson, parsearRespuestaModelo, objetosJson, aNumero, normalizarAvisos, calcularEstadisticas, percentil,
   limpiarLink, claveLink, hashCorto, recolectarUrls, precisionDe, candidatosGeo, superficieBase,
   distanciaKm, coordValida, limpiarDireccion, crearGeocoder,
   tokkoToProp, parcheTokko, medidas,
